@@ -5,8 +5,13 @@
   "main": "src/extension.ts",
   "scripts": {
     "build": "tsc",
-    "relay": "node src/relay.js",
-    "claude-bridge": "node src/claude-bridge.js"
+    "relay": "npx tsx src/relay.ts",
+    "claude-bridge": "npx tsx src/claude-bridge.ts",
+    "dev": "npx tsx src/extension.ts"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=1.0.0",
+    "@mariozechner/pi-ai": ">=1.0.0"
   },
   "keywords": [
     "pi",
@@ -23,6 +28,8 @@
   },
   "devDependencies": {
     "typescript": "^5.0.0",
-    "@types/ws": "^8.5.0"
+    "@types/ws": "^8.5.0",
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0"
   }
 }
