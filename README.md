@@ -584,7 +584,7 @@ peer_status({ peer: "vps" })     // specific agent
 |---|---|---|---|
 | `peer` | string | ❌ | Specific peer, or all if omitted |
 
-Output shows: online/offline, role, session name, capabilities, IP address, bridge status.
+Output shows: status (🟢 online / 🟡 busy / 🔴 offline), role, session name, capabilities, queue depth, IP address, bridge status.
 
 ---
 
@@ -660,6 +660,89 @@ manage_agent({ action: "list" })
 
 ---
 
+### `task_history`
+
+View all tasks — sent, received, pending, running, completed, or failed.
+
+```
+task_history()
+task_history({ status: "running" })
+task_history({ peer: "vps" })
+task_history({ taskId: "task-abc123" })
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `status` | string | ❌ | Filter: `queued`, `running`, `completed`, `failed`, `killed` |
+| `peer` | string | ❌ | Filter by peer name |
+| `taskId` | string | ❌ | Look up a specific task |
+
+### `ask_origin`
+
+Ask a clarifying question to the sender of your current task. Routes through the chain (worker → manager → instructor). If no one knows, the human user is asked.
+
+```
+ask_origin({ question: "Which auth module? auth.ts or auth-v2.ts?" })
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `question` | string | ✅ | The question to ask |
+
+### `kill_task`
+
+Kill a queued or running task on any agent. Instructors and managers only.
+
+```
+kill_task({ taskId: "task-abc123" })
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `taskId` | string | ✅ | The task to kill |
+| `peer` | string | ❌ | Which agent to kill it on (default: all in chain) |
+
+### `return_task`
+
+Return a task to your manager because you can't complete it. Manager decides whether to reassign, handle it, or ask instructor.
+
+```
+return_task({ reason: "this needs devops expertise" })
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `reason` | string | ✅ | Why you're returning the task |
+
+### `sync_project`
+
+Sync a git project to a remote agent. Token-free git push/pull over Tailscale.
+
+```
+sync_project({ peer: "laptop", path: "~/projects/my-app", branch: "feature-oauth" })
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `peer` | string | ✅ | Peer to sync with |
+| `path` | string | ✅ | Local project path (must be a git repo) |
+| `branch` | string | ❌ | Branch (default: current branch) |
+
+### `send_vault`
+
+Send encrypted secrets to a remote agent. Never touches git, relay, or LLM.
+
+```
+send_vault({ peer: "vps", secrets: ["prod_db_password", "deploy_token"] })
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `peer` | string | ✅ | Peer to send secrets to |
+| `secrets` | string[] | ✅ | Names of secrets from your local vault |
+
+---
+
 ## Configuration Reference
 
 ### Config File
@@ -702,6 +785,8 @@ Location: `~/.pi/agent/bridge/config.json`
   "deadLetterHours": 48,           // hours before undelivered messages expire
   "taskTimeout": 600,              // seconds before a task times out
   "maxQueueSize": 50,              // max pending messages per peer
+  "maxConcurrentTasks": 3,         // max tasks an agent processes simultaneously
+  "vaultKey": "set-a-strong-key",  // network-wide encryption key for secrets
 
   // ─── Peers ───────────────────────────────────────
   "peers": {
@@ -743,6 +828,8 @@ Location: `~/.pi/agent/bridge/config.json`
     task-abc123/
       auth.ts
       Dockerfile
+  vault.json               # Encrypted local secrets vault
+  task-history.jsonl       # Persistent task audit log
   dead-letter/             # Expired undelivered messages
 ```
 
@@ -835,6 +922,8 @@ The LLM uses this to make smart delegation decisions without extra tool calls.
 | Registry sync | **Zero** |
 | File lock check | **Zero** |
 | Queue management | **Zero** |
+| Vault transfer (`send_vault`) | **Zero** | Encrypted HTTP, no LLM |
+| Git sync (`sync_project`) | **Zero** | Raw git commands |
 | Agent task (`mode: "agent"`) | Receiver's tokens only |
 | Delegation decision | ~50 tokens (in system prompt) |
 | Reading results | Sender's tokens (result text) |

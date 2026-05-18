@@ -1,6 +1,6 @@
 # Pi Network — Product Requirements Document
 
-> **Version:** 1.0.0  
+> **Version:** 1.1.0  
 > **Date:** 2026-05-19  
 > **Status:** Draft  
 > **Repository:** https://github.com/jamezun/pi-network
@@ -27,7 +27,7 @@ Pi Network is a Pi coding agent extension that turns multiple Pi instances (and 
 2. **Capability-based delegation** — Agents know what other agents are good at and delegate accordingly.
 3. **Hierarchy** — Manager and worker roles with proper chain of command.
 4. **Task chain tracking** — Every result traces back to the original instructor.
-5. **File safety** — Distributed file locking prevents concurrent edits.
+5. **File safety** — Distributed line-range locking prevents concurrent edits on the same lines, while allowing multiple agents to work on different parts of the same file simultaneously.
 6. **Offline resilience** — Tasks queue and auto-deliver when peers come back online.
 7. **Multi-network** — Tailscale (default), public server, hybrid, or local-only.
 8. **Claude Code integration** — Claude Code instances participate as workers via a bridge server.
@@ -140,9 +140,13 @@ interface TaskEnvelope {
   chain: ChainHop[];            // every hop in order
   task: string;
   taskType: "agent" | "raw" | "file" | "notification";
+  status: "queued" | "running" | "completed" | "failed" | "killed" | "reassigned" | "waiting_for_answer";
   lockScope: string[];          // files this task intends to touch
   requiresConsolidation: boolean;
   deliverTo: string;            // who gets the result
+  projectContext?: ProjectContext;
+  requiredSecrets?: string[];  // names of secrets from vault
+  partialWork?: string;        // work done so far (if reassigned)
 }
 
 interface ChainHop {
@@ -150,22 +154,160 @@ interface ChainHop {
   session: string;
   role: "instructor" | "manager" | "worker";
   timestamp: number;
+  action: "delegated" | "reassigned" | "clarified";
+}
+
+interface ProjectContext {
+  cwd: string;            // working directory on the worker's machine
+  repo?: string;          // git remote URL (if applicable)
+  branch?: string;       // branch to checkout
+  keyFiles: string[];    // file list only — worker reads on demand
 }
 ```
 
 **Guarantee:** Every result traces back through the chain to the original instructor. No work is lost.
 
-### 3.5 File Locking
+### 3.5 Line-Range Locking
 
-Distributed file locks prevent concurrent edits:
+Distributed line-range locks prevent conflicting edits while maximizing parallelism:
 
-- Before any `write` or `edit` tool call, the extension checks if the file is locked.
+- Locks are scoped to **specific line ranges** within a file, not the entire file.
+- Multiple agents can edit the same file simultaneously as long as their line ranges don't overlap.
+- Before any `write` or `edit` tool call, the extension checks if the affected lines overlap with any existing lock.
+- The `edit` tool's `oldText` is used to resolve the exact line range being modified.
+- The `write` tool locks the entire file (since it replaces the whole content).
 - Locks are stored on the relay server (server/hybrid mode) or tracked locally (tailscale mode).
 - Locks are scoped to a `rootTaskId` and released when the task chain completes.
 - Auto-expire after 1 hour as a safety net.
 - Agents can request a lock with a timeout using `request_file_lock` tool.
 
-### 3.6 Result Routing
+**Example — Two agents editing the same file:**
+
+```
+File: src/app.ts (200 lines)
+
+Agent A locks:   lines 1-50    (imports and config)
+Agent B locks:   lines 120-180 (utility functions)
+
+Both work simultaneously. No conflict.
+
+If Agent A tries to edit lines 120-130 → BLOCKED (overlaps with B's lock)
+If Agent A tries to edit lines 60-80   → ALLOWED (no overlap)
+```
+
+**Line range resolution:**
+
+The extension resolves line ranges differently per tool:
+
+| Tool | Lock Scope | How Resolved |
+|------|-----------|-------------|
+| `edit` | Lines matching `oldText` | Read file, find `oldText`, compute start/end line |
+| `write` | Entire file | All lines (full file replacement) |
+| `bash` | No lock | Shell commands are not tracked (user responsibility) |
+
+**Line shift tracking:**
+
+When an edit inserts or deletes lines, all other locks on the same file have their line ranges adjusted:
+
+- Lines inserted above a lock → lock's start/end shift down by the inserted line count
+- Lines deleted above a lock → lock's start/end shift up by the deleted line count
+- This ensures locks stay accurate relative to the content they protect
+
+**Lock data structure:**
+
+```typescript
+interface LineRangeLock {
+  filePath: string;
+  startLine: number;       // 1-based inclusive
+  endLine: number;         // 1-based inclusive
+  agent: string;
+  session: string;
+  taskId: string;
+  rootTaskId: string;
+  since: number;
+  description?: string;   // human-readable: "refactoring imports"
+}
+```
+
+**Overlap detection:**
+
+Two locks conflict if they are on the same file AND their line ranges overlap:
+
+```typescript
+function rangesOverlap(a: LineRangeLock, b: LineRangeLock): boolean {
+  if (a.filePath !== b.filePath) return false;
+  if (a.agent === b.agent) return false; // same agent can overlap own locks
+  return a.startLine <= b.endLine && b.startLine <= a.endLine;
+}
+```
+
+### 3.6 Task Lifecycle & Concurrency
+
+Each agent can handle multiple tasks concurrently:
+
+- **Default concurrency:** 3 tasks (configurable via `maxConcurrentTasks` in config).
+- Tasks run in the **background** — the agent's listener is never blocked.
+- Incoming messages, clarification questions, and kill commands are always received immediately, even while tasks are running.
+- If the LLM crashes or freezes on one task, other tasks and the listener continue unaffected.
+- If an agent is at capacity (all slots full), new tasks queue until a slot frees up.
+
+```json
+{
+  "maxConcurrentTasks": 3
+}
+```
+
+**Task states:**
+
+```
+queued → running → completed
+                 → failed
+                 → reassigned (sent back to manager)
+                 → waiting_for_answer (asked origin a question)
+                 → killed (instructor or manager cancelled)
+```
+
+### 3.7 Task Intake — Idle-Aware Injection
+
+When a remote task arrives at an agent:
+
+1. Check if the agent is idle (`ctx.isIdle()`).
+2. If idle → inject the task immediately via `pi.sendUserMessage()`.
+3. If busy → queue the task and show a widget: `📬 2 remote tasks waiting`.
+4. When the agent finishes its current work → inject the next queued task.
+
+This prevents context pollution — two unrelated conversations never get tangled in the same turn.
+
+### 3.8 Two-Way Clarification
+
+Any agent in the chain can ask a clarifying question and get an answer before continuing:
+
+```
+Worker → asks question → Manager → answers (or asks Instructor) → answer flows back to Worker
+```
+
+- Worker calls `ask_origin({ question: "Which auth module?" })`.
+- Question routes through the chain to the sender (one hop back).
+- If the sender (manager) knows the answer → responds directly.
+- If the manager is unsure → routes question further up to its sender (instructor).
+- If the instructor is unsure → asks the human user via Pi's TUI.
+- Answer flows back down the chain to the asking worker.
+- Worker's task is paused until the answer arrives (slot stays occupied).
+
+### 3.9 Task Reassignment
+
+If a worker cannot complete a task:
+
+1. Worker sends the task back to its manager with `return_task({ reason: "need devops specialist" })`.
+2. Manager receives the returned task.
+3. Manager decides:
+   - **Reassign** to a better-suited worker: `remote_task({ peer: "vps", task: ... })`.
+   - **Do it themselves**: inject the task into their own session.
+   - **Ask instructor**: route up the chain via `ask_origin`.
+4. The task envelope records the reassignment in the chain.
+5. Partial work done by the first worker is included in the forwarded envelope.
+
+### 3.10 Result Routing
 
 ```
 Instructor → Manager → Worker A
@@ -231,22 +373,178 @@ Check status of one or all remote agents.
 |---|---|---|
 | `peer` | string (optional) | Specific peer, or all if omitted |
 
-Shows: online/offline, role, session name, capabilities, Tailscale IP, bridge status.
+Shows: status (🟢 online / 🟡 busy / 🔴 offline), role, session name, capabilities, queue depth, Tailscale IP, bridge status.
 
 ### 4.5 `list_locks`
 
-Show all active file locks across the network.
+Show all active line-range locks across the network.
 
-### 4.6 `request_file_lock`
-
-Request a lock on a file, blocking until available or timeout.
+```
+list_locks()
+list_locks({ path: "./src/app.ts" })  // filter by file
+```
 
 | Parameter | Type | Description |
 |---|---|---|
-| `path` | string | File path to lock |
+| `path` | string (optional) | Filter to a specific file |
+
+Output:
+```
+🔒 ./src/app.ts
+   lines 1-50     → laptop/build (since 14:32) — "refactoring imports"
+   lines 120-180  → vps/deploy (since 14:33) — "updating utilities"
+🔒 ./src/config.ts
+   lines 10-30    → vps/deploy (since 14:34) — "database config"
+```
+
+### 4.6 `request_file_lock`
+
+Wait for a line-range lock to become available.
+
+```
+request_file_lock({ path: "./src/app.ts", startLine: 1, endLine: 50 })
+request_file_lock({ path: "./src/app.ts", startLine: 120, endLine: 180, timeout: 120 })
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | string | File to lock |
+| `startLine` | number (optional) | Start line, 1-based inclusive (default: 1) |
+| `endLine` | number (optional) | End line, 1-based inclusive (default: last line = entire file) |
+| `description` | string (optional) | Human-readable reason for the lock |
 | `timeout` | number (optional) | Max seconds to wait (default: 300) |
 
-### 4.7 `manage_agent`
+If `startLine` and `endLine` are omitted, locks the entire file (backward compatible with full-file locking).
+
+### 4.7 `task_history`
+
+View all tasks across the network — sent, received, pending, running, completed, or failed.
+
+```
+task_history()
+task_history({ status: "running" })
+task_history({ peer: "vps" })
+task_history({ taskId: "task-abc123" })
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `status` | string (optional) | Filter: `queued`, `running`, `completed`, `failed`, `killed`, `reassigned` |
+| `peer` | string (optional) | Filter by peer name |
+| `taskId` | string (optional) | Look up a specific task |
+
+Output:
+```
+📋 Task History
+
+📤 Sent:
+  task-abc123  → vps       running    "deploy to production"    2 min ago
+  task-abc124  → laptop    completed  "run test suite"          5 min ago
+
+📥 Received:
+  task-abc125  ← desktop   queued     "check docker"            just now
+  task-abc126  ← desktop   completed  "refactor auth"           1 hour ago
+```
+
+### 4.8 `ask_origin`
+
+Ask a clarifying question to the sender of the current task. Routes through the chain. Pauses the current task until answered.
+
+```
+ask_origin({ question: "Which auth module should I refactor? auth.ts or auth-v2.ts?" })
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `question` | string | The question to ask |
+
+### 4.9 `kill_task`
+
+Kill a queued or running task on any agent in the network. Only the instructor or a manager can kill tasks.
+
+```
+kill_task({ taskId: "task-abc123" })
+kill_task({ taskId: "task-abc123", peer: "vps" })
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `taskId` | string | The task to kill |
+| `peer` | string (optional) | Which agent to kill it on (default: all agents in chain) |
+
+### 4.10 `return_task`
+
+Worker returns a task to its manager because it cannot complete it. Includes partial work.
+
+```
+return_task({ reason: "this needs devops expertise, I only do frontend" })
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `reason` | string | Why the task is being returned |
+
+### 4.11 `sync_project`
+
+Git-based project sync between agents. Pushes code to a shared bare repo over Tailscale so the worker can pull the latest version. Token-free.
+
+```
+sync_project({ peer: "laptop", path: "~/projects/my-app", branch: "feature-oauth" })
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `peer` | string | Peer to sync with |
+| `path` | string | Local project path (must be a git repo) |
+| `branch` | string (optional) | Branch to push/pull (default: current branch) |
+
+**Flow:**
+1. Manager: `git push` to bare repo over Tailscale (token-free raw command)
+2. Worker: `git pull` from bare repo (token-free raw command)
+3. Worker has full codebase locally, can read files and run tests
+4. Worker: does work, commits, `git push` back
+5. Manager: `git pull` to collect results
+
+**Setup (one-time):**
+```bash
+# On manager machine
+mkdir -p ~/git-remote
+# For each project
+cd ~/projects/my-app
+git init --bare ~/git-remote/my-app.git
+git remote add shared ~/git-remote/my-app.git
+```
+
+**Worker config:**
+```json
+{
+  "sharedRepos": {
+    "my-app": "ssh://desktop/~/git-remote/my-app.git"
+  }
+}
+```
+
+### 4.12 `send_vault`
+
+Send encrypted secrets to a remote agent. Secrets never touch git or travel in plaintext.
+
+```
+send_vault({ peer: "vps", secrets: ["prod_db_password", "deploy_token"] })
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `peer` | string | Peer to send secrets to |
+| `secrets` | string[] | Names of secrets from local vault to send |
+
+**Security:**
+- Secrets are encrypted with a network-wide `vaultKey` (set once in config on each machine)
+- Encrypted payload sent over Tailscale HTTP (double-encrypted: app-level AES + WireGuard)
+- Worker decrypts with same key, injects as env vars during task
+- Temporary secrets deleted from worker's vault after task completes
+- Secrets **never** go through git, relay, or LLM prompts
+
+### 4.13 `manage_agent`
 
 Update the agent registry (capabilities, roles, hierarchy).
 
@@ -271,9 +569,11 @@ On every turn, the extension injects a section into the system prompt:
 
 Connected via Tailscale VPN. All peers reachable directly.
 
-### 🟢 Online
+### 🟢 Online (idle)
 - 👤 **laptop** (worker) — coding, design, testing | css, react, ui-testing
-- 👤 **vps** (worker) — devops, deployment | docker, nginx, linux
+
+### 🟡 Online (busy)
+- 👤 **vps** (worker) — 1 task running, 1 queued | devops, docker, nginx
 
 ### 🔴 Offline (tasks will be queued)
 - ~~**staging**~~ (worker) — testing | integration-testing
@@ -328,6 +628,8 @@ Messages that remain undelivered after a configurable deadline (default: 48 hour
 | `deadLetterHours` | 48 | Hours before undelivered messages expire |
 | `taskTimeout` | 600 sec | Seconds before a remote task is considered timed out |
 | `maxQueueSize` | 50 | Max messages per peer outbox |
+| `maxConcurrentTasks` | 3 | Max tasks an agent processes simultaneously |
+| `vaultKey` | — | Network-wide encryption key for secret transfers (set once) |
 
 ---
 
@@ -555,6 +857,8 @@ Location: `~/.pi/agent/bridge/config.json`
       auth.ts
       Dockerfile
   dead-letter/             # Expired undelivered messages
+  vault.json               # Encrypted local secrets vault
+  task-history.jsonl       # Persistent task audit log
   locks-cache.json         # Local cache of file locks
 ```
 
@@ -591,7 +895,12 @@ Location: `~/.pi/agent/bridge/config.json`
 | Claude Bridge crash | Task fails, error returned to sender |
 | Large result (>50KB) | Truncate in message, save full result as file |
 | Dead letter (48h undelivered) | Move to dead-letter directory, notify user |
-| Concurrent tasks on same receiver | Queue on receiver, process sequentially |
+| Concurrent tasks on same receiver | Queue on receiver, process up to `maxConcurrentTasks` in parallel |
+| Worker cannot complete task | `return_task` to manager, manager reassigns or handles |
+| Instructor closes Pi before result arrives | Result queued, delivered when instructor comes back online (retry every `retryInterval`) |
+| Worker needs clarification | `ask_origin` routes question through chain, task pauses until answered |
+| Instructor wants to cancel | `kill_task` kills task on any agent in the network |
+| Agent LLM crashes during task | Other tasks and listener unaffected (background execution) |
 
 ---
 
@@ -613,9 +922,15 @@ pi-network/
 │   ├── core/
 │   │   ├── config.ts             # Config loading + mode detection
 │   │   ├── registry.ts           # Agent registry management
-│   │   ├── locks.ts              # Distributed file locking
+│   │   ├── locks.ts              # Distributed line-range locking
 │   │   ├── queue.ts              # Offline message queue
 │   │   ├── tasks.ts              # Task envelope + chain of custody
+│   │   ├── concurrency.ts        # Concurrent task manager (N slots)
+│   │   ├── clarification.ts      # Two-way clarification routing
+│   │   ├── reassignment.ts       # Task return + reassignment logic
+│   │   ├── project-sync.ts       # Git-based project sync
+│   │   ├── vault.ts              # Encrypted secret management
+│   │   ├── task-history.ts       # Task audit log + history
 │   │   ├── files.ts              # File transfer + storage
 │   │   └── prompt.ts             # System prompt builder
 │   └── tools/
@@ -625,6 +940,12 @@ pi-network/
 │       ├── peer-status.ts        # peer_status tool
 │       ├── list-locks.ts         # list_locks tool
 │       ├── request-lock.ts       # request_file_lock tool
+│       ├── task-history.ts       # task_history tool
+│       ├── ask-origin.ts         # ask_origin tool
+│       ├── kill-task.ts          # kill_task tool
+│       ├── return-task.ts        # return_task tool
+│       ├── sync-project.ts      # sync_project tool
+│       ├── send-vault.ts         # send_vault tool
 │       └── manage-agent.ts       # manage_agent tool
 ├── deploy/
 │   ├── docker-compose.yml        # Docker deployment
@@ -665,21 +986,40 @@ pi-network/
 - [ ] Docker + systemd deployment
 
 ### Phase 3: Coordination
-- [ ] Distributed file locking
+- [ ] Distributed line-range locking
 - [ ] `list_locks` + `request_file_lock` tools
 - [ ] Task envelope with chain of custody
 - [ ] Manager consolidation (wait for all sub-tasks, merge results)
 - [ ] `broadcast_task` tool
 - [ ] File attachment in results
 - [ ] Dead letter handling
+- [ ] Idle-aware task injection (wait for agent to be idle)
+- [ ] Concurrent task execution (configurable slots, default 3)
+- [ ] Background execution (listener always free, LLM crash isolation)
 
-### Phase 4: Intelligence
+### Phase 3.5: Communication & Control
+- [ ] `task_history` tool (audit log of all tasks across network)
+- [ ] `ask_origin` tool (two-way clarification through chain, human fallback)
+- [ ] `kill_task` tool (instructor can kill any task on any agent)
+- [ ] `return_task` tool (worker returns task to manager, manager reassigns)
+- [ ] Agent load status (🟢 online / 🟡 busy / 🔴 offline)
+- [ ] Result persistence (wait for offline instructor, configurable retry interval)
+
+### Phase 4: Intelligence & Project Sync
 - [ ] Agent registry on relay (capabilities, roles, hierarchy)
 - [ ] Registry push to all agents on update
-- [ ] Smart system prompt (online/offline, capabilities, delegation hints)
+- [ ] Smart system prompt (online/busy/offline, capabilities, load, delegation hints)
 - [ ] `manage_agent` tool (register/update/remove agents)
 - [ ] Auto-registration on startup (self-declare capabilities)
 - [ ] Tailscale status integration (native peer discovery)
+- [ ] `sync_project` tool (git-based project sync over Tailscale)
+- [ ] Project context in task envelopes (cwd, keyFiles list)
+
+### Phase 4.5: Security
+- [ ] Encrypted vault system (`vault.json` + network-wide `vaultKey`)
+- [ ] `send_vault` tool (encrypted secret transfer, separate from git)
+- [ ] Temporary secrets auto-deleted after task completes
+- [ ] Secrets never touch git, relay, or LLM prompts
 
 ### Phase 5: Claude Integration
 - [ ] Claude Bridge server (`claude -p` wrapper)
@@ -718,6 +1058,9 @@ pi-network/
 | Task chain breaks (agent crashes) | Medium | Result not delivered | Dead letter detection; retry with backoff |
 | Large context from system prompt | Low | Token cost increase | Keep agent descriptions concise (~50 tokens per peer) |
 | Security (unauthorized access) | Low | Untrusted agent joins network | Tailscale ACLs + API key auth + allowlist |
+| Secret leakage through git | Medium | API keys committed to git | Vault system separates secrets from code; `send_vault` never touches git |
+| LLM crash during concurrent task | Low | Task interrupted, slot freed | Background execution isolates tasks; listener always available |
+| Stale result delivered late | Medium | Result arrives after user moved on | `task_history` shows pending results; old results clearly timestamped |
 
 ---
 
