@@ -147,6 +147,8 @@ interface TaskEnvelope {
   projectContext?: ProjectContext;
   requiredSecrets?: string[];  // names of secrets from vault
   partialWork?: string;        // work done so far (if reassigned)
+  priority?: "urgent" | "high" | "normal" | "low";
+  userId?: string;             // human who originated the task
 }
 
 interface ChainHop {
@@ -267,6 +269,21 @@ queued → running → completed
                  → killed (instructor or manager cancelled)
 ```
 
+**Agent states:**
+
+| State | Color | Meaning |
+|---|---|---|
+| Idle | 🟢 online | Ready for tasks |
+| Working | 🟡 busy | Running tasks, sending heartbeats |
+| Frozen | 🟠 unresponsive | Alive but no activity (thinking, output, tool calls) for `heartbeatTimeout` seconds |
+| Down | 🔴 offline | Unreachable |
+
+When an agent goes 🟠 unresponsive:
+- Manager gets notified: `⚠️ VPS unresponsive for 10 minutes on task-abc123`
+- Manager can: wait longer, `ask_origin` to check, or `kill_task` and reassign
+- Instructor sees it in `task_history`
+- Heartbeat tracks all activity: thinking output, tool calls, message updates, progress — any signal the LLM is alive
+
 ### 3.7 Task Intake — Idle-Aware Injection
 
 When a remote task arrives at an agent:
@@ -335,6 +352,13 @@ Send a task to a remote agent.
 | `peer` | string | Peer name from config |
 | `task` | string | The task description |
 | `mode` | string (optional) | `"agent"` (default), `"inbox"`, `"raw"` |
+| `priority` | string (optional) | `"urgent"`, `"high"`, `"normal"` (default), `"low"` |
+
+**Priority behavior:**
+- `urgent` — Jumps to front of queue, pauses current task
+- `high` — Jumps to front of queue, waits for current task to finish
+- `normal` — Standard queue order
+- `low` — Processed only when queue is empty
 
 **Modes:**
 - `agent` — Full LLM processing on receiver (costs tokens on receiver)
@@ -630,6 +654,8 @@ Messages that remain undelivered after a configurable deadline (default: 48 hour
 | `maxQueueSize` | 50 | Max messages per peer outbox |
 | `maxConcurrentTasks` | 3 | Max tasks an agent processes simultaneously |
 | `vaultKey` | — | Network-wide encryption key for secret transfers (set once) |
+| `heartbeatTimeout` | 600 sec | Seconds with no activity before agent marked 🟠 unresponsive |
+| `userId` | — | Human identity for multi-user support (email or username) |
 
 ---
 

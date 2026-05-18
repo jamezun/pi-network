@@ -527,6 +527,7 @@ remote_task({ peer: "claude-laptop", task: "research React best practices" })
 | `peer` | string | ✅ | Peer name from config |
 | `task` | string | ✅ | The task to execute |
 | `mode` | string | ❌ | `"agent"` (default), `"raw"`, `"inbox"` |
+| `priority` | string | ❌ | `"urgent"`, `"high"`, `"normal"` (default), `"low"` |
 
 **Modes:**
 - `"agent"` — Full LLM processing on the receiver. Costs tokens on the receiver's side. Best for complex tasks.
@@ -584,7 +585,7 @@ peer_status({ peer: "vps" })     // specific agent
 |---|---|---|---|
 | `peer` | string | ❌ | Specific peer, or all if omitted |
 
-Output shows: status (🟢 online / 🟡 busy / 🔴 offline), role, session name, capabilities, queue depth, IP address, bridge status.
+Output shows: status (🟢 online / 🟡 busy / 🟠 unresponsive / 🔴 offline), role, session name, capabilities, queue depth, IP address, bridge status.
 
 ---
 
@@ -786,7 +787,9 @@ Location: `~/.pi/agent/bridge/config.json`
   "taskTimeout": 600,              // seconds before a task times out
   "maxQueueSize": 50,              // max pending messages per peer
   "maxConcurrentTasks": 3,         // max tasks an agent processes simultaneously
+  "heartbeatTimeout": 600,         // seconds with no activity before marked unresponsive
   "vaultKey": "set-a-strong-key",  // network-wide encryption key for secrets
+  "userId": "james@company.com",   // your identity (for multi-user support)
 
   // ─── Peers ───────────────────────────────────────
   "peers": {
