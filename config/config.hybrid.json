@@ -1,0 +1,19 @@
+{
+  "localName": "desktop",
+  "bridgePort": 9764,
+  "role": "manager",
+  "capabilities": ["coding", "architecture", "research"],
+  "specialties": ["typescript", "python", "system-design"],
+  "manages": ["laptop", "vps"],
+  "server": {
+    "url": "https://bridge.example.com",
+    "apiKey": "change-me-to-a-strong-random-secret"
+  },
+  "peers": {
+    "desktop":       { "type": "pi" },
+    "laptop":        { "type": "pi" },
+    "vps":           { "type": "pi" },
+    "cloud-worker":  { "type": "pi", "forceServer": true },
+    "claude-laptop": { "type": "claude", "bridgePort": 9766 }
+  }
+}

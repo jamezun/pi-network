@@ -1,0 +1,28 @@
+{
+  "name": "pi-network",
+  "version": "1.0.0",
+  "description": "Turn multiple Pi coding agents into a coordinated agent mesh with smart delegation, file locking, and chain-of-custody result tracking.",
+  "main": "src/extension.ts",
+  "scripts": {
+    "build": "tsc",
+    "relay": "node src/relay.js",
+    "claude-bridge": "node src/claude-bridge.js"
+  },
+  "keywords": [
+    "pi",
+    "coding-agent",
+    "agent-mesh",
+    "delegation",
+    "tailscale",
+    "mcp"
+  ],
+  "author": "jamezun",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/ws": "^8.5.0"
+  }
+}

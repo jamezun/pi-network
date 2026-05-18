@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  relay:
+    build: ..
+    ports:
+      - "9765:9765"
+    environment:
+      - BRIDGE_PORT=9765
+      - BRIDGE_API_KEY=${BRIDGE_API_KEY:-change-me}
+    volumes:
+      - relay-data:/app/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9765/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  relay-data:

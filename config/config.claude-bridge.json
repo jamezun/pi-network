@@ -1,0 +1,11 @@
+{
+  "localName": "claude-laptop",
+  "bridgePort": 9766,
+  "role": "worker",
+  "reportTo": "desktop",
+  "capabilities": ["research", "analysis", "writing"],
+  "specialties": ["market-research", "code-review", "documentation"],
+  "peers": {
+    "desktop": { "type": "pi" }
+  }
+}

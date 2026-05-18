@@ -1,0 +1,13 @@
+{
+  "localName": "desktop",
+  "bridgePort": 9764,
+  "role": "manager",
+  "capabilities": ["coding", "architecture", "research"],
+  "specialties": ["typescript", "python", "system-design"],
+  "manages": ["laptop", "vps"],
+  "peers": {
+    "desktop": { "type": "pi" },
+    "laptop":  { "type": "pi" },
+    "vps":     { "type": "pi" }
+  }
+}
