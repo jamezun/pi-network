@@ -20,8 +20,10 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { resolve, join } from "node:path";
-import { existsSync, readFileSync, mkdirSync } from "node:fs";
+import { resolve, join, dirname } from "node:path";
+import { existsSync, readFileSync, mkdirSync, writeFile } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
+import { execSync } from "node:child_process";
 
 import { loadConfig, resolveMode, getBridgeDir, getPeerUrl, getTailnetPeers } from "./core/config";
 import type { BridgeConfig, NetworkMode, AgentStatus } from "./core/config";
@@ -33,7 +35,7 @@ import { ConcurrencyManager } from "./core/concurrency";
 import { acquireLock, releaseAllForTask, checkFileLock, getAllLocks, getLocksForFile } from "./core/locks";
 import {
   loadRegistry, updateAgentInRegistry, pruneDeadEntries,
-  markStale, markReachable, readRegistryEntry,
+  markStale, markReachable, readRegistryEntry, removeRegistryEntry,
 } from "./core/registry";
 import type { AgentEntry } from "./core/registry";
 import { pushToOutbox } from "./core/queue";
@@ -49,8 +51,15 @@ import { loadPersonaFiles } from "./core/personas";
 import type { PersonaDef } from "./core/personas";
 import { ulid } from "./core/ulid";
 
-// ─── Line cap for socket reads (prevents OOM from giant payloads) ───
-const LINE_CAP_BYTES = 64 * 1024;
+// ─── Body-size caps (prevent OOM from giant payloads) ───
+// Default cap for control endpoints (/task, /result, /clarification, etc.)
+const LINE_CAP_BYTES = 1 * 1024 * 1024;          // 1 MB — task envelopes can carry context, locks, etc.
+// Larger cap for file transfers (/file uses base64, so ~33% overhead)
+const FILE_CAP_BYTES = 64 * 1024 * 1024;          // 64 MB after base64 ≈ 48 MB binary
+
+function capForPath(pathname: string): number {
+  return pathname === "/file" ? FILE_CAP_BYTES : LINE_CAP_BYTES;
+}
 
 // ─── State ───
 
@@ -85,13 +94,17 @@ const pendingTasks: Map<string, PendingTask> = new Map();
 let bridgeServer: any;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let pruneTimer: ReturnType<typeof setInterval> | null = null;
+let pendingTasksTimer: ReturnType<typeof setInterval> | null = null;
 let pi: ExtensionAPI;
+
+// Max age for an unresolved pendingTasks entry (1 hour).
+// task_await default timeout is 30 min, so 1 hour is a safe upper bound.
+const PENDING_TASK_TTL_MS = 60 * 60 * 1000;
 
 // ─── Local Bridge Server ───
 
 function startLocalBridge(port: number) {
-  const http = require("http");
-  bridgeServer = http.createServer(async (req: any, res: any) => {
+  bridgeServer = createHttpServer(async (req: any, res: any) => {
     // Restrict CORS to localhost only (security improvement from coms)
     const origin = req.headers.origin || "";
     if (origin && !origin.includes("127.0.0.1") && !origin.includes("localhost")) {
@@ -103,16 +116,17 @@ function startLocalBridge(port: number) {
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     if (req.method === "OPTIONS") { res.end(); return; }
 
-    const url = new URL(req.url, `http://${req.headers.host}`);
+    const url = new URL(req.url || "/", `http://${req.headers.host}`);
     let body: any = {};
     if (req.method === "POST") {
+      const cap = capForPath(url.pathname);
       let raw = "";
       let bytesRead = 0;
       for await (const chunk of req) {
         bytesRead += chunk.length;
-        if (bytesRead > LINE_CAP_BYTES) {
+        if (bytesRead > cap) {
           res.writeHead(413);
-          res.end(JSON.stringify({ error: "Payload too large" }));
+          res.end(JSON.stringify({ error: "Payload too large", limit: cap, path: url.pathname }));
           return;
         }
         raw += chunk;
@@ -126,6 +140,9 @@ function startLocalBridge(port: number) {
     }
 
     if (req.method === "GET" && url.pathname === "/status") {
+      // Pull the freshest context usage from the local registry entry
+      // (heartbeat writes it every 30s).
+      const localEntry = readRegistryEntry(config.localName);
       res.end(JSON.stringify({
         name: config.localName,
         sessionName: pi.getSessionName?.() || "unknown",
@@ -134,7 +151,7 @@ function startLocalBridge(port: number) {
         queueLength: concurrency.getQueueLength(),
         activeTaskCount: concurrency.getRunningCount(),
         maxConcurrentTasks: config.maxConcurrentTasks,
-        contextUsedPct: 0, // will be filled by heartbeat
+        contextUsedPct: localEntry?.contextUsedPct ?? 0,
         color: config.color,
         purpose: config.purpose,
       }));
@@ -144,15 +161,19 @@ function startLocalBridge(port: number) {
     if (req.method === "POST" && url.pathname === "/task") {
       const envelope: TaskEnvelope = body;
 
+      // Defensive: legacy senders may omit hops field — treat as 0.
+      const inboundHops = typeof envelope.hops === "number" ? envelope.hops : 0;
+      envelope.hops = inboundHops;
+
       // Hop limit check on inbound
-      if (envelope.hops >= config.maxHops) {
-        appendAudit({ event: "hop_exceeded", taskId: envelope.taskId, sender: envelope.originInstructor, hops: envelope.hops });
+      if (inboundHops >= config.maxHops) {
+        appendAudit({ event: "hop_exceeded", taskId: envelope.taskId, sender: envelope.originInstructor, hops: inboundHops });
         res.writeHead(400);
         res.end(JSON.stringify({ error: "hops exceeded", maxHops: config.maxHops }));
         return;
       }
 
-      currentInboundHops = envelope.hops;
+      currentInboundHops = inboundHops;
       const action = concurrency.enqueue(envelope);
       updateHistoryStatus(envelope.taskId, action === "queued" ? "queued" : "running");
       appendAudit({ event: "inbound_prompt", taskId: envelope.taskId, sender: envelope.originInstructor, hops: envelope.hops });
@@ -183,15 +204,19 @@ function startLocalBridge(port: number) {
     }
 
     if (req.method === "POST" && url.pathname === "/file") {
-      res.end(JSON.stringify({ received: true }));
       const dir = getBridgeDir();
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       const dest = body.remotePath || join(dir, "inbox", body.filename);
-      const { writeFile } = require("node:fs");
-      const { dirname: dn } = require("node:path");
-      const destDir = dn(dest);
+      const destDir = dirname(dest);
       if (!existsSync(destDir)) mkdirSync(destDir, { recursive: true });
-      writeFile(dest, Buffer.from(body.content, "base64"), () => {});
+      writeFile(dest, Buffer.from(body.content, "base64"), (err) => {
+        if (err) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ received: false, error: err.message }));
+        } else {
+          res.end(JSON.stringify({ received: true, path: dest }));
+        }
+      });
       return;
     }
 
@@ -265,6 +290,24 @@ function startPruneLoop() {
     }
   }, 60_000);
   try { (pruneTimer as any).unref?.(); } catch {}
+}
+
+function startPendingTasksCleanup() {
+  if (pendingTasksTimer) return;
+  pendingTasksTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [taskId, pending] of pendingTasks) {
+      if (now - pending.createdAt > PENDING_TASK_TTL_MS) {
+        if (pending.timer) clearTimeout(pending.timer);
+        // Signal the awaiter (if any) that we gave up before silently dropping
+        if (pending.resolve && !pending.result) {
+          try { pending.resolve({ taskId, rootTaskId: taskId, from: "(expired)", fromSession: "", deliverTo: "", deliverToSession: "", result: "(pending entry expired)", files: [], chain: [], originInstructor: "", originSession: "", needsConsolidation: false, isConsolidated: false, partialResults: [], status: "failed" } as TaskResult); } catch {}
+        }
+        pendingTasks.delete(taskId);
+      }
+    }
+  }, 5 * 60_000);
+  try { (pendingTasksTimer as any).unref?.(); } catch {}
 }
 
 // ─── Task Injection ───
@@ -403,6 +446,7 @@ export default function extension(api: ExtensionAPI) {
     startLocalBridge(config.bridgePort);
     startHeartbeat();
     startPruneLoop();
+    startPendingTasksCleanup();
 
     updateAgentInRegistry(agents, {
       name: config.localName, role: config.role,
@@ -471,7 +515,10 @@ export default function extension(api: ExtensionAPI) {
     stopLocalBridge();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (pruneTimer) clearInterval(pruneTimer);
-    updateAgentInRegistry(agents, { name: config.localName, status: "offline" });
+    if (pendingTasksTimer) clearInterval(pendingTasksTimer);
+    // Remove the entry entirely so peers see us disappear immediately;
+    // PID-pruning would catch it eventually but ~60s later.
+    try { removeRegistryEntry(config.localName); } catch {}
   });
 
   pi.on("before_agent_start", async (event, _ctx) => {
@@ -1109,17 +1156,15 @@ export default function extension(api: ExtensionAPI) {
       const peerUrl = getPeerUrl(params.peer, config);
 
       if (params.direction === "push") {
-        const { execSync } = require("node:child_process");
         try {
           execSync(`git remote remove pi-${params.peer} 2>/dev/null || true`, { cwd: projectPath });
           execSync(`git remote add pi-${params.peer} ${peerUrl}/git/${params.project || "default"}`, { cwd: projectPath });
-          execSync(`git push pi-${params.peer} HEAD`, { cwd: projectPath, timeout: 30000 }); // removed --force for safety
+          execSync(`git push pi-${params.peer} HEAD`, { cwd: projectPath, timeout: 30000 }); // intentionally no --force
           return { content: [{ type: "text", text: `✅ Pushed to ${params.peer}` }] };
         } catch (e: any) {
           return { content: [{ type: "text", text: `❌ Push failed: ${e.message}` }] };
         }
       } else {
-        const { execSync } = require("node:child_process");
         try {
           execSync(`git remote remove pi-${params.peer} 2>/dev/null || true`, { cwd: projectPath });
           execSync(`git remote add pi-${params.peer} ${peerUrl}/git/${params.project || "default"}`, { cwd: projectPath });

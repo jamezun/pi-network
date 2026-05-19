@@ -3,7 +3,7 @@
 // ~/.pi/agent/bridge/agents/<name>.json + PID validation + stale counter.
 // Stolen from coms.ts: writeRegistryAtomic + pruneDeadEntries.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { getBridgeDir } from "./config";
 
@@ -55,8 +55,7 @@ export function writeRegistryAtomic(entry: AgentEntry): void {
   const data = JSON.stringify({ ...entry, lastSeen: Date.now() }, null, 2);
   try {
     writeFileSync(tmpPath, data, "utf8");
-    // On most OS, rename is atomic
-    const { renameSync } = require("node:fs");
+    // On most OS, rename is atomic — crash mid-write never corrupts the live file.
     renameSync(tmpPath, filePath);
   } catch {
     // Fallback: direct write (not atomic but better than nothing)

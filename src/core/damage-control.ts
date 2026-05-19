@@ -29,7 +29,9 @@ const DEFAULT_RULES: DamageControlRules = {
     { pattern: "aws\\s+s3\\s+rm\\s+--recursive", reason: "Recursive S3 delete", ask: false },
     { pattern: "docker\\s+system\\s+prune", reason: "Docker system prune", ask: true },
     { pattern: "chmod\\s+-R\\s+777", reason: "Insecure recursive permissions", ask: true },
-    { pattern: ":\\(\\)\\s*\\{\\s*:|\\.&\\s*\\}", reason: "Fork bomb pattern", ask: false },
+    // Classic fork-bomb signature: :(){ :|: & };:
+    // Match the function definition (`:(){ `) — the only realistic prefix.
+    { pattern: ":\\s*\\(\\s*\\)\\s*\\{[^}]*:\\s*\\|\\s*:", reason: "Fork bomb pattern", ask: false },
     { pattern: "mkfs\\.", reason: "Filesystem format", ask: false },
     { pattern: "dd\\s+.*of=/dev/", reason: "Raw device write", ask: false },
   ],

@@ -1,6 +1,6 @@
 // Pi Network — Offline message queue
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { getBridgeDir } from "./config";
 import type { TaskEnvelope } from "./tasks";
@@ -65,7 +65,6 @@ export function removeFromOutbox(peer: string, taskId: string): void {
     const data = tasks.map((t) => JSON.stringify(t)).join("\n") + "\n";
     writeFileSync(tmpPath, data, "utf8");
     try {
-      const { renameSync } = require("node:fs");
       renameSync(tmpPath, filePath);
     } catch {
       writeFileSync(filePath, data, "utf8");
