@@ -57,11 +57,33 @@ export class LocalTransport implements Transport {
   }
 
   async sendClarification(peer: string, taskId: string, question: string): Promise<SendResult> {
-    return this.send(peer, { taskId, task: question } as any);
+    try {
+      const port = this.config.peers[peer]?.bridgePort || this.config.bridgePort;
+      const res = await fetch(`http://${peer}:${port}/clarification`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId, question, from: this.config.localName }),
+        signal: AbortSignal.timeout(5000),
+      });
+      return { delivered: res.ok, queued: !res.ok };
+    } catch {
+      return { delivered: false, queued: true };
+    }
   }
 
   async sendAnswer(peer: string, taskId: string, answer: string): Promise<SendResult> {
-    return this.send(peer, { taskId, task: answer } as any);
+    try {
+      const port = this.config.peers[peer]?.bridgePort || this.config.bridgePort;
+      const res = await fetch(`http://${peer}:${port}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId, answer, from: this.config.localName }),
+        signal: AbortSignal.timeout(5000),
+      });
+      return { delivered: res.ok, queued: !res.ok };
+    } catch {
+      return { delivered: false, queued: true };
+    }
   }
 
   async sendKill(peer: string, taskId: string): Promise<void> {

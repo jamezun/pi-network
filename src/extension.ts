@@ -2,26 +2,26 @@
 // The main entry point. Registers tools, manages tasks, handles communication.
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "typebox";
+import { Type } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { resolve, dirname, join } from "node:path";
+import { resolve, join } from "node:path";
 import { existsSync, readFileSync, mkdirSync } from "node:fs";
 
 import { loadConfig, resolveMode, getBridgeDir, getPeerUrl, getTailnetPeers } from "./core/config";
 import type { BridgeConfig, NetworkMode, AgentStatus } from "./core/config";
-import { createEnvelope, extractResultFromMessages, generateId } from "./core/tasks";
+import { createEnvelope, extractResultFromMessages } from "./core/tasks";
 import type { TaskEnvelope, TaskResult } from "./core/tasks";
 import { createTransport } from "./transport";
 import type { Transport } from "./transport";
 import { ConcurrencyManager } from "./core/concurrency";
-import { acquireLock, releaseLock, releaseAllForTask, checkFileLock, shiftLocksAfterEdit, getAllLocks, getLocksForFile } from "./core/locks";
+import { acquireLock, releaseAllForTask, checkFileLock, getAllLocks, getLocksForFile } from "./core/locks";
 import { loadRegistry, updateAgentInRegistry } from "./core/registry";
 import type { AgentEntry } from "./core/registry";
-import { pushToOutbox, readAllOutbox } from "./core/queue";
+import { pushToOutbox } from "./core/queue";
 import { buildAgentPrompt } from "./core/prompt";
-import { getSecret, listSecretNames, encryptForTransfer, decryptTransfer } from "./core/vault";
+import { getSecret, encryptForTransfer } from "./core/vault";
 import { appendHistory, readHistory, updateHistoryStatus, formatHistory } from "./core/task-history";
-import { readFileForSend, saveReceivedFile } from "./core/files";
+import { readFileForSend } from "./core/files";
 
 // ─── State ───
 
@@ -66,7 +66,9 @@ function startLocalBridge(port: number) {
 
     if (req.method === "GET" && url.pathname === "/status") {
       res.end(JSON.stringify({
-        name: config.localName, sessionName: "active", role: config.role,
+        name: config.localName,
+        sessionName: pi.getSessionName?.() || "unknown",
+        role: config.role,
         online: true, status: localStatus,
         queueLength: concurrency.getQueueLength(),
         activeTaskCount: concurrency.getRunningCount(),
@@ -627,7 +629,7 @@ export default function extension(api: ExtensionAPI) {
 
       const encrypted = encryptForTransfer({ [params.key]: secret }, config.vaultKey!);
       await transport.send(params.peer, {
-        task: `VAULT:${params.key}:${encrypted.encrypted}:${params.taskId}`,
+        task: `VAULT:${params.key}:${encrypted}:${params.taskId}`,
         taskType: "raw",
         priority: "urgent",
       } as any);

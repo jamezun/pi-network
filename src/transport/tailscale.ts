@@ -5,7 +5,7 @@ import type { BridgeConfig } from "../core/config";
 import type { TaskEnvelope, TaskResult } from "../core/tasks";
 import type { FilePayload } from "../core/files";
 import { getPeerUrl } from "../core/config";
-import { pushToOutbox, readOutbox, removeFromOutbox } from "../core/queue";
+import { pushToOutbox, readAllOutbox, removeFromOutbox } from "../core/queue";
 
 export class TailscaleTransport implements Transport {
   private handler: ((msg: any) => void) | null = null;
@@ -119,7 +119,7 @@ export class TailscaleTransport implements Transport {
 
   private startRetryLoop(): void {
     this.retryTimer = setInterval(async () => {
-      const outbox = require("../core/queue").readAllOutbox();
+      const outbox = readAllOutbox();
       for (const [peer, messages] of Object.entries(outbox)) {
         const online = await this.ping(peer);
         if (!online) continue;

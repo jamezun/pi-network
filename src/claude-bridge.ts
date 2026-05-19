@@ -4,10 +4,10 @@
 // Usage: node claude-bridge.js
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
-import { execSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:fs";
+import { homedir } from "node:os";
 
 const BRIDGE_DIR = join(homedir(), ".pi", "agent", "bridge");
 const CONFIG_FILE = join(BRIDGE_DIR, "config.json");
@@ -43,7 +43,7 @@ function shellEscape(str: string): string {
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = "";
-    req.on("data", (chunk: string) => { body += chunk; });
+    req.on("data", (chunk: Buffer) => { body += chunk.toString("utf8"); });
     req.on("end", () => resolve(body));
     req.on("error", reject);
   });

@@ -12,7 +12,7 @@ export function buildAgentPrompt(
   localStatus: AgentStatus,
   tailnetPeers?: Map<string, { online: boolean; ip: string }>
 ): string {
-  if (agents.length === 0 && Object.keys(config.peers).size <= 1) return "";
+  if (agents.length === 0 && Object.keys(config.peers).length <= 1) return "";
 
   const myName = config.localName;
   const otherAgents = agents.filter((a) => a.name !== myName);
