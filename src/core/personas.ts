@@ -44,7 +44,14 @@ export function parsePersonaFile(filePath: string): PersonaDef | null {
     for (const line of match[1].split("\n")) {
       const idx = line.indexOf(":");
       if (idx > 0) {
-        frontmatter[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+        const key = line.slice(0, idx).trim();
+        let value = line.slice(idx + 1).trim();
+        // Strip surrounding quotes (YAML-style)
+        if ((value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1);
+        }
+        frontmatter[key] = value;
       }
     }
 

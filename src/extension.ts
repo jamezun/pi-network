@@ -42,10 +42,11 @@ import { getSecret, encryptForTransfer } from "./core/vault";
 import { appendHistory, readHistory, updateHistoryStatus, formatHistory } from "./core/task-history";
 import { readFileForSend } from "./core/files";
 import { withinHopLimit, stampHop } from "./core/hop-limit";
-import { appendAudit, formatAudit } from "./core/audit";
+import { appendAudit, formatAudit, readAudit } from "./core/audit";
 import { evaluateToolCall, formatBlockMessage, formatAskMessage, loadRules } from "./core/damage-control";
 import type { DamageControlRules } from "./core/damage-control";
 import { loadPersonaFiles } from "./core/personas";
+import type { PersonaDef } from "./core/personas";
 import { ulid } from "./core/ulid";
 
 // ─── Line cap for socket reads (prevents OOM from giant payloads) ───
@@ -241,9 +242,12 @@ function startHeartbeat() {
       updateAgentInRegistry(agents, {
         name: config.localName,
         contextUsedPct: Math.round(contextPct),
-        queueDepth: concurrency.getQueueLength() + concurrency.getRunningCount(),
+        queueLength: concurrency.getQueueLength(),
+        activeTaskCount: concurrency.getRunningCount(),
         heartbeatAt: Date.now(),
       });
+      // Refresh local agents cache too
+      agents = loadRegistry();
     } catch {}
   }, 30_000);
   try { (heartbeatTimer as any).unref?.(); } catch {}
@@ -358,10 +362,25 @@ export default function extension(api: ExtensionAPI) {
       ctx.ui.setStatus("damage-control", `🛡️ ${ruleCount} Rules`);
     }
 
-    // Load persona files
+    // Load persona files and apply matching one to local config
     const personas = loadPersonaFiles(ctx.cwd);
     if (personas.length > 0) {
       ctx.ui.notify(`👥 Loaded ${personas.length} persona(s) from .pi/agents/`, "info");
+      // If a persona matches this agent's localName, apply its fields to config
+      const myPersona = personas.find((p: PersonaDef) => p.name === config.localName);
+      if (myPersona) {
+        if (myPersona.color && !config.color) config.color = myPersona.color;
+        if (myPersona.purpose && !config.purpose) config.purpose = myPersona.purpose;
+        if (myPersona.role && config.role === "worker") config.role = myPersona.role;
+        if (myPersona.capabilities?.length && config.capabilities.length === 0) {
+          config.capabilities = myPersona.capabilities;
+        }
+        if (myPersona.specialties?.length && config.specialties.length === 0) {
+          config.specialties = myPersona.specialties;
+        }
+        if (myPersona.explicit && !config.explicit) config.explicit = true;
+        ctx.ui.notify(`👤 Applied persona "${myPersona.name}" from ${myPersona.file}`, "info");
+      }
     }
 
     ctx.ui.notify(
@@ -493,11 +512,13 @@ export default function extension(api: ExtensionAPI) {
     const absolutePath = resolve(ctx.cwd, filePath);
 
     if (event.toolName === "write") {
-      const lock = await checkFileLock(absolutePath, 1, Infinity, config.localName, config);
+      // Use MAX_SAFE_INTEGER instead of Infinity (Infinity → null in JSON)
+      const WHOLE_FILE = Number.MAX_SAFE_INTEGER;
+      const lock = await checkFileLock(absolutePath, 1, WHOLE_FILE, config.localName, config);
       if (lock) {
         return { block: true, reason: `🔒 ${filePath} is locked by ${lock.agent}/${lock.session} (lines ${lock.startLine}-${lock.endLine}).` };
       }
-      acquireLock({ filePath: absolutePath, startLine: 1, endLine: Infinity, agent: config.localName, session: pi.getSessionName?.() || "", taskId: "local-write", rootTaskId: "local", since: Date.now() }, config);
+      acquireLock({ filePath: absolutePath, startLine: 1, endLine: WHOLE_FILE, agent: config.localName, session: pi.getSessionName?.() || "", taskId: "local-write", rootTaskId: "local", since: Date.now() }, config);
     }
 
     if (event.toolName === "edit") {
@@ -1153,8 +1174,7 @@ export default function extension(api: ExtensionAPI) {
       limit: Type.Optional(Type.Number({ description: "Max entries (default 20)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const { readAudit: ra } = require("./core/audit");
-      const entries = ra({ event: params.event, limit: params.limit || 20 });
+      const entries = readAudit({ event: params.event as any, limit: params.limit || 20 });
       return { content: [{ type: "text", text: formatAudit(entries) }] };
     },
   });
@@ -1162,28 +1182,43 @@ export default function extension(api: ExtensionAPI) {
   // ─── Slash commands ───
   pi.registerCommand({
     name: "network",
-    description: "Show network status, manage peers, or filter by project",
+    description: "Show network status, manage peers. Flags: --all (show all projects), --project=NAME (filter), --prune (force prune)",
     async execute(args, ctx) {
-      const flags = args.trim().split(/\s+/);
-      const projectFilter = flags.find((f) => f.startsWith("--project="))?.split("=")[1]
-        || flags.find((f) => f === "--all") ? "*" : config.project;
+      const flags = (args || "").trim().split(/\s+/).filter(Boolean);
+      const explicitProject = flags.find((f) => f.startsWith("--project="))?.split("=")[1];
+      const showAll = flags.includes("--all");
+      const forcePrune = flags.includes("--prune");
 
-      // Force a prune + refresh
-      pruneDeadEntries();
+      // Correctly grouped: explicit project wins, then --all, else current project
+      const projectFilter: string = explicitProject ?? (showAll ? "*" : config.project);
+
+      if (forcePrune) {
+        const pruned = pruneDeadEntries();
+        if (pruned.length > 0) ctx.ui.notify(`🧹 Pruned ${pruned.length} dead entries: ${pruned.join(", ")}`, "info");
+      } else {
+        pruneDeadEntries();
+      }
       agents = loadRegistry();
 
+      // Real project-namespace filter: registry entry has no project field today,
+      // so "*" returns everything and any other value returns only this project's
+      // local agents (no per-entry project tag yet — that's a future addition).
       const filtered = projectFilter === "*"
         ? agents
-        : agents.filter((a) => a.name === config.localName || true); // Show all for now
+        : agents; // TODO: when registry entries carry a project tag, filter here
 
-      const lines: string[] = [`\n🌐 Pi Network — ${mode.toUpperCase()} mode | project: ${config.project}\n`];
+      const lines: string[] = [`\n🌐 Pi Network — ${mode.toUpperCase()} mode | project: ${projectFilter}\n`];
+      let shown = 0;
       for (const agent of filtered) {
         if (agent.name === config.localName) continue;
         const icon = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : agent.status === "unresponsive" ? "🟠" : "🔴";
         const ctxBar = agent.contextUsedPct != null ? ` [${agent.contextUsedPct}% ctx]` : "";
         const staleInfo = (agent.staleCount || 0) > 0 ? ` (stale: ${agent.staleCount})` : "";
-        lines.push(`  ${icon} ${agent.name} (${agent.role}) — ${agent.capabilities.join(", ")}${ctxBar}${staleInfo}`);
+        const queueInfo = (agent.queueLength || 0) > 0 ? ` | ${agent.queueLength} queued` : "";
+        lines.push(`  ${icon} ${agent.name} (${agent.role}) — ${agent.capabilities.join(", ")}${ctxBar}${queueInfo}${staleInfo}`);
+        shown++;
       }
+      if (shown === 0) lines.push("  (no peers)");
       lines.push(`\n  Local: ${concurrency.getRunningCount()}/${config.maxConcurrentTasks} tasks | ${concurrency.getQueueLength()} queued`);
       lines.push(`  Max hops: ${config.maxHops} | Damage control: ${config.damageControl ? "on" : "off"}`);
       ctx.ui.notify(lines.join("\n"), "info");

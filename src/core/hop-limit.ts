@@ -8,15 +8,18 @@ const DEFAULT_MAX_HOPS = Number(process.env.PI_NETWORK_MAX_HOPS) || 5;
 
 /**
  * Check if a new outbound envelope would exceed the hop limit.
- * Returns true if the envelope is allowed, false if it should be rejected.
+ * Returns { allowed: false } if it should be rejected.
+ *
+ * Rules:
+ *   - If this send is a forward (we have currentInboundHops), new hops = inbound + 1
+ *   - If this is an originating send, hops = 0
  */
 export function withinHopLimit(
-  envelope: TaskEnvelope,
+  _envelope: TaskEnvelope,
   currentInboundHops?: number,
   maxHops: number = DEFAULT_MAX_HOPS
 ): { allowed: boolean; hops: number; maxHops: number } {
-  // Outbound hop count = inbound hops + 1 (or 0 if originating)
-  const hops = currentInboundHops != null ? currentInboundHops + 1 : envelope.chain.length;
+  const hops = currentInboundHops != null ? currentInboundHops + 1 : 0;
   return {
     allowed: hops < maxHops,
     hops,
@@ -25,15 +28,14 @@ export function withinHopLimit(
 }
 
 /**
- * Stamp a hop count onto an envelope's chain.
+ * Stamp a hop count onto an envelope.
  * Call this before sending to record the new hop.
  */
 export function stampHop(
   envelope: TaskEnvelope,
   currentInboundHops?: number
 ): number {
-  const hops = currentInboundHops != null ? currentInboundHops + 1 : envelope.chain.length;
-  // Chain already records delegation — but we also add a hops field for quick checks
-  (envelope as any).hops = hops;
+  const hops = currentInboundHops != null ? currentInboundHops + 1 : 0;
+  envelope.hops = hops;
   return hops;
 }
