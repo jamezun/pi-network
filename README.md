@@ -21,6 +21,8 @@ Desktop Pi: "✅ Deployed to production. Tests: 44/45 passing (1 flaky)."
 
 ## Features
 
+### Core mesh
+
 - 🌐 **Peer-to-peer agent mesh** — Any Pi talks to any other Pi by name
 - 🧠 **Smart delegation** — Agents know what other agents are good at
 - 📂 **File transfer** — Send files between agents, token-free
@@ -32,6 +34,37 @@ Desktop Pi: "✅ Deployed to production. Tests: 44/45 passing (1 flaky)."
 - 🌍 **Server mode** — Public relay for machines without Tailscale
 - 🤖 **Claude Code integration** — Claude instances participate as workers
 - 💰 **Token-efficient** — Files, notifications, and raw commands cost zero tokens
+
+### Safety & observability (v2)
+
+- 🛡️ **Damage control** — YAML rule engine intercepts destructive bash and path operations before they run
+- 🔄 **Hop limits** — Bounded forwarding chain (`MAX_HOPS=5`) prevents A↔B delegation loops
+- 🔐 **Privacy-respecting audit log** — Records `msg_id`, sender, hops — never task body or secrets
+- 🧹 **Self-healing registry** — Atomic per-agent files, PID-based liveness pruning, stale counter
+- 📊 **Live pool widget** — Coloured peer cards with context-usage bars, always visible below the editor
+- 👥 **Persona files** — Drop a `.md` file in `.pi/agents/` to define an agent's name, color, role, capabilities
+- 🎛️ **CLI flags** — `--name`, `--purpose`, `--color`, `--project`, `--explicit` to spawn variants without editing config
+- 🧬 **Multi-project namespacing** — Separate mesh per project; `--project=*` to span all
+- ⚡ **Split tools** — `task_send` + `task_get` + `task_await` for fire-and-forget, poll, or block patterns
+- 🧪 **Optional response schema** — Request JSON-shaped replies from a peer
+- 🆔 **ULID message IDs** — Time-sortable, debug-friendly
+- 💬 **`/network` slash command** — Live status, `--prune`, `--all` for multi-project view
+
+---
+
+## What Problems It Solves
+
+| Problem | Without Pi Network | With Pi Network |
+|---|---|---|
+| Two agents on the same code | Copy-paste between terminals | `remote_task` — answer lands in your chat |
+| Long-running work blocks main agent | One context, one job | `task_send` + `task_await`, keep working |
+| Concurrent edits collide | Lost work | Per-line-range locks, distributed via the relay |
+| Delegation loop A→B→A→B | Runs until killed | Hop limit rejects past `MAX_HOPS=5` |
+| Peer crashes silently | Phantom entries | PID pruning + stale counter mark them offline |
+| Audit logs leak secrets | Full task text on disk | Audit log only stores metadata |
+| Remote agent runs `rm -rf` on shared mount | One bad prompt, lost data | Damage Control blocks or asks before executing |
+| Per-role peer setup | Hardcode + restart | Drop a `.pi/agents/coder.md` persona file |
+| Cross-project peer collisions | Single shared namespace | `project` flag isolates them |
 
 ---
 
@@ -108,6 +141,136 @@ Pi Network auto-detects the best mode on startup:
 | **Server** | No Tailscale, server config present | WebSocket + polling via relay | Yes |
 | **Hybrid** | Tailscale + server config | Tailscale direct, server fallback | Yes |
 | **Local** | Neither | Direct HTTP on LAN only | No |
+
+---
+
+## CLI Flags (v2)
+
+Override the config without editing files. Useful for running multiple seats on the same machine or for one-off experiments.
+
+```bash
+pi --name=planner --purpose="Plans the work" --color="#36F9F6"
+pi --name=coder   --purpose="Writes the code" --color="#FF7EDB" --project=app
+pi --name=prod-pii-redactor --explicit                 # hidden from auto-discovery
+```
+
+| Flag | Type | Purpose |
+|---|---|---|
+| `--name=NAME` | string | Override `localName` |
+| `--purpose=TEXT` | string | Short label shown in the pool widget |
+| `--project=NAME` | string | Namespace this peer to a project; isolates it from other meshes |
+| `--color=#RRGGBB` | string | Card color in the pool widget |
+| `--explicit` | bool | Hide from auto-discovery — peers must address by exact name |
+
+Flags override config.json values, which in turn override `.pi/agents/*.md` persona defaults.
+
+---
+
+## Personas (v2)
+
+Define agents declaratively with `.md` files. Drop one into `.pi/agents/` (project) or `~/.pi/agents/` (global). The persona's `name` is matched against `localName`; if it matches, its frontmatter and body are applied automatically.
+
+**Example: `.pi/agents/planner.md`**
+
+```markdown
+---
+name: planner
+description: Plans the work, breaks problems down, reviews specs
+color: "#36F9F6"
+role: manager
+capabilities: planning, architecture, system-design
+specialties: code-review, refactoring
+explicit: false
+---
+
+You are the planner. Decompose work into concrete, testable units.
+Delegate execution to coder, researcher, or verifier — don't write code yourself.
+Always ask for explicit approval before kicking off > 3 parallel tasks.
+```
+
+| Frontmatter | What it sets |
+|---|---|
+| `name` | Match against `localName` to apply |
+| `description` / `purpose` | Pool-widget label |
+| `color` | Card color (`#RRGGBB`) |
+| `role` | `manager` or `worker` |
+| `capabilities` | CSV — augments config |
+| `specialties` | CSV — augments config |
+| `explicit` | `true` to hide from auto-discovery |
+
+Body becomes the persona system prompt addendum.
+
+Search order: `./.pi/agents/` → `~/.pi/agents/` → `~/.pi/agent/bridge/agents-personas/`. First match wins.
+
+---
+
+## Damage Control (v2)
+
+A YAML rule engine intercepts every `tool_call` against your safety rules **before** execution. Catches `rm -rf /`, force-pushes, prod-secret reads, and other catastrophic moves — whether they came from your local agent or were delegated by a remote peer.
+
+### Enable
+
+```jsonc
+// ~/.pi/agent/bridge/config.json
+{ "damageControl": true }
+```
+
+### Rules file
+
+Project-level: `.pi/damage-control-rules.yaml`
+Global: `~/.pi/damage-control-rules.yaml`
+
+```yaml
+# Hard-block dangerous bash patterns (regex). ask: true to confirm first.
+bashToolPatterns:
+  - { pattern: "rm\\s+-rf\\s+/",            reason: "Recursive force delete from root", ask: true }
+  - { pattern: "git\\s+push\\s+.*--force",  reason: "Force push to remote",             ask: true }
+  - { pattern: "DROP\\s+DATABASE",          reason: "SQL drop database" }
+  - { pattern: "mkfs\\.",                   reason: "Filesystem format" }
+  - { pattern: "dd\\s+.*of=/dev/",          reason: "Raw device write" }
+
+# Zero access — block ALL reads and writes to these paths.
+zeroAccessPaths:
+  - "~/.ssh/"
+  - "~/.aws/"
+  - "*.pem"
+  - ".env.production"
+
+# Read-only — allow read, block write/edit/bash.
+readOnlyPaths:
+  - "/etc/"
+  - "package-lock.json"
+  - "yarn.lock"
+
+# No-delete — allow modification, block rm.
+noDeletePaths:
+  - ".git/"
+  - "Dockerfile"
+  - "README.md"
+```
+
+### Behaviour
+
+| Verdict | Effect |
+|---|---|
+| `blocked: false` | Tool call proceeds normally |
+| `blocked: true, ask: true` | UI prompts the user; 30s timeout = deny |
+| `blocked: true, ask: false` | Hard block with anti-bypass message |
+
+Every block/confirm/deny is recorded in the privacy-respecting audit log — no command bodies stored, only the rule that fired.
+
+A copy of the default rules lives at `config/damage-control-rules.yaml` in this repo.
+
+---
+
+## Slash Commands (v2)
+
+| Command | What it does |
+|---|---|
+| `/network` | One-shot network status — peers, slots, queues, hop limit |
+| `/network --all` | Include every project namespace, not just yours |
+| `/network --project=app` | Show only a specific project |
+| `/network --prune` | Force a PID-liveness sweep before printing |
 
 ---
 
@@ -538,6 +701,74 @@ remote_task({ peer: "claude-laptop", task: "research React best practices" })
 
 ---
 
+### `task_send` (v2)
+
+Send a task but **don't wait** — get back a `taskId` and `msg_id` you can poll later. Useful when you want to fire several requests in parallel and decide later which to block on.
+
+```
+task_send({ peer: "vps", task: "run the full integration suite" })
+// → { taskId: "task-l...", msgId: "01HKM...", delivered: true, hops: 0 }
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `peer` | string | ✅ | Peer name |
+| `task` | string | ✅ | The task |
+| `mode` | string | ❌ | `"agent"` / `"raw"` / `"inbox"` |
+| `priority` | string | ❌ | `"urgent"` / `"high"` / `"normal"` / `"low"` |
+| `response_schema` | object | ❌ | JSON Schema describing the expected reply shape |
+
+If you're already inside an inbound task, the returned `hops` increments automatically. Sends are blocked once `hops >= maxHops` (default 5) — kills runaway A→B→A→B loops at the source.
+
+---
+
+### `task_get` (v2)
+
+**Non-blocking** poll on a `taskId` returned by `task_send`. Returns `pending`, `complete`, or `expired` immediately.
+
+```
+task_get({ taskId: "task-l..." })
+// → "⏳ Pending... (47s elapsed, target: vps)"
+// or
+// → "✅ Complete from vps: All 124 tests passed."
+```
+
+---
+
+### `task_await` (v2)
+
+**Blocking** wait on a `taskId`. Resolves when the reply lands or `timeout_ms` elapses (default 30 min).
+
+```
+task_await({ taskId: "task-l...", timeout_ms: 60000 })
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `taskId` | string | ✅ | from `task_send` |
+| `timeout_ms` | number | ❌ | Max wait in ms (default 1 800 000 = 30 min) |
+
+Pattern: `task_send` × N peers, then `task_await` on the first you care about — you get true bidirectional fan-out with zero polling.
+
+---
+
+### `audit_log` (v2)
+
+View the privacy-respecting audit trail. Records only metadata: `msg_id`, sender, target, hops, event type — **never the task body or any secrets**.
+
+```
+audit_log()                          // last 20 entries
+audit_log({ event: "blocked" })      // damage-control blocks only
+audit_log({ event: "hop_exceeded" }) // loops we prevented
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `event` | string | ❌ | Filter: `outbound_prompt`, `inbound_prompt`, `response`, `blocked`, `confirmed`, `hop_exceeded`, `self_heal` |
+| `limit` | number | ❌ | Max entries (default 20) |
+
+---
+
 ### `send_file`
 
 Send a file to a remote agent. Token-free.
@@ -791,6 +1022,14 @@ Location: `~/.pi/agent/bridge/config.json`
   "vaultKey": "set-a-strong-key",  // network-wide encryption key for secrets
   "userId": "james@company.com",   // your identity (for multi-user support)
 
+  // ─── v2: Safety & Identity ───────────────────────
+  "maxHops": 5,                    // Forwarding hop limit (loops blocked beyond this)
+  "project": "default",            // Namespace for peer discovery; isolate per repo if needed
+  "damageControl": true,           // Enable the YAML rules engine (intercepts every tool_call)
+  "color": "#36F9F6",              // Card color in the pool widget
+  "purpose": "Plans the work",     // Short label shown next to your name
+  "explicit": false,               // true = hide from auto-discovery, addressable by exact name only
+
   // ─── Peers ───────────────────────────────────────
   "peers": {
     "desktop": {
@@ -821,7 +1060,9 @@ Location: `~/.pi/agent/bridge/config.json`
 ```
 ~/.pi/agent/bridge/
   config.json              # Agent configuration
-  agents-cache.json        # Cached registry from relay
+  agents/                  # v2: atomic per-agent registry files (PID-pruned)
+    desktop.json
+    laptop.json
   outbox/                  # Pending outgoing messages (offline peers)
     laptop.jsonl
     vps.jsonl
@@ -832,8 +1073,16 @@ Location: `~/.pi/agent/bridge/config.json`
       auth.ts
       Dockerfile
   vault.json               # Encrypted local secrets vault
-  task-history.jsonl       # Persistent task audit log
+  task-history.jsonl       # Persistent task audit log (append-only status updates)
+  audit-log.jsonl          # v2: Privacy-respecting audit log (msg_id + sender + hops only)
   dead-letter/             # Expired undelivered messages
+
+# v2 — optional, project-scoped:
+.pi/
+  agents/                  # Persona .md files for this project
+    planner.md
+    coder.md
+  damage-control-rules.yaml
 ```
 
 ---
@@ -891,6 +1140,33 @@ Agent A: finishes task → lock released → Agent B can proceed
 
 Locks auto-expire after 1 hour as a safety net.
 
+### Hop Limit (v2)
+
+Every task envelope carries a `hops` counter, inherited from the inbound prompt that triggered it. `task_send`/`remote_task` increments by 1; receivers reject inbound tasks where `hops >= maxHops` (default 5).
+
+```
+desktop (hops=0)
+  → laptop (hops=1)
+    → vps (hops=2)
+      → desktop (hops=3)
+        → laptop (hops=4)
+          → vps (hops=5) ❌ rejected
+```
+
+The audit log records every `hop_exceeded` event so loops are visible after the fact.
+
+### Self-Healing Registry (v2)
+
+Each agent atomically writes its own file under `~/.pi/agent/bridge/agents/<name>.json` (write-to-`.tmp` then `rename`), including its PID. A 60-second loop on every agent runs `process.kill(pid, 0)` against each entry; dead PIDs are unlinked. Failed pings increment a per-peer stale counter that fades the card in the pool widget after 3 misses and marks it offline.
+
+Crash-survivor: a SIGKILL'd Pi disappears from the network within ~60s without any cleanup hooks running.
+
+### Damage Control (v2)
+
+The extension subscribes to Pi's `tool_call` event. Every call — local or triggered by a remote task — is evaluated against the YAML rule set before the tool runs. The rule that fires is stored in the audit log; the rule body and command are not.
+
+Three verdicts: allow, ask (UI prompt with 30s deny-on-timeout), or hard block (with anti-bypass language to dissuade the LLM from creative workarounds).
+
 ### System Prompt Injection
 
 Every turn, the extension injects agent info into the system prompt:
@@ -927,6 +1203,9 @@ The LLM uses this to make smart delegation decisions without extra tool calls.
 | Queue management | **Zero** |
 | Vault transfer (`send_vault`) | **Zero** | Encrypted HTTP, no LLM |
 | Git sync (`sync_project`) | **Zero** | Raw git commands |
+| Damage-control rule check | **Zero** | Local regex eval, pre-tool |
+| Hop-limit check | **Zero** | Counter on envelope |
+| Audit log write | **Zero** | Append-only metadata |
 | Agent task (`mode: "agent"`) | Receiver's tokens only |
 | Delegation decision | ~50 tokens (in system prompt) |
 | Reading results | Sender's tokens (result text) |
@@ -986,6 +1265,28 @@ Force a specific mode in config:
 }
 ```
 
+### "❌ Hop limit reached" (v2)
+
+You hit `MAX_HOPS=5`. Either the task is genuinely deep (raise `maxHops` in config) or you have an A↔B loop. Check `audit_log({ event: "hop_exceeded" })` for the chain.
+
+### "🛡️ BLOCKED by Damage Control" (v2)
+
+A rule fired against your tool call. Review which rule:
+
+```
+audit_log({ event: "blocked", limit: 5 })
+```
+
+If the block is wrong, edit `.pi/damage-control-rules.yaml` and restart. Or set `damageControl: false` in config to disable entirely.
+
+### "Phantom peers in /network" (v2)
+
+PID pruning runs every 60s, but you can force it: `/network --prune`. If a peer's `pid` field is missing in `~/.pi/agent/bridge/agents/<name>.json`, it can't be auto-pruned — delete the file manually.
+
+### "task_send returned but task_await hangs" (v2)
+
+Default timeout is 30 minutes. Pass `timeout_ms` to shorten it. If a `pendingTasks` entry is older than 1 hour, the cleanup loop resolves it with a `failed` status — check `task_history({ taskId })`.
+
 ---
 
 ## Examples
@@ -1034,6 +1335,39 @@ Pi calls: send_file({ peer: "vps", path: "./nginx.conf", remotePath: "/etc/nginx
 
 Pi: ✅ Sent ./nginx.conf → vps:/etc/nginx/nginx.conf
 ```
+
+### Fire-and-Forget then Await (v2)
+
+```
+You: "kick off the integration suite on vps and the lint check on laptop, keep me posted"
+
+Pi calls:
+  task_send({ peer: "vps",    task: "run integration suite" })
+  // → taskId=task-l..., msgId=01HKM...
+  task_send({ peer: "laptop", task: "run lint + typecheck" })
+  // → taskId=task-m..., msgId=01HKN...
+
+Pi continues other work, then:
+  task_await({ taskId: "task-l...", timeout_ms: 600000 })
+  // ✅ Result from vps: 124/124 passed in 4m37s
+
+  task_get({ taskId: "task-m..." })
+  // ⏳ Pending... (90s elapsed, target: laptop)
+```
+
+Three primitives — `task_send`, `task_get`, `task_await` — cover fire-and-forget, poll, and block patterns with no extra machinery.
+
+### Persona-Driven Pool (v2)
+
+```bash
+# Terminal 1
+pi --name=planner --color="#36F9F6"
+
+# Terminal 2
+pi --name=coder --color="#FF7EDB" --project=app
+```
+
+Pool widget shows both colored cards. Planner can delegate to coder by name with `task_send` — the response lands back in planner's chat.
 
 ### Hierarchy Delegation
 
