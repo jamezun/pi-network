@@ -1,0 +1,58 @@
+# Pi Network — Damage Control Rules
+# Place at .pi/damage-control-rules.yaml (project) or ~/.pi/damage-control-rules.yaml (global)
+# These rules intercept tool calls to prevent catastrophic mistakes when agents execute commands.
+
+# Bash command patterns — matched as regex against the command string
+# ask: true = require user confirmation before executing
+# ask: false (default) = hard block
+bashToolPatterns:
+  - pattern: "rm\\s+-rf\\s+/"
+    reason: "Recursive force delete from root"
+    ask: true
+  - pattern: "git\\s+reset\\s+--hard"
+    reason: "Destructive git reset"
+    ask: true
+  - pattern: "git\\s+push\\s+.*--force"
+    reason: "Force push to remote"
+    ask: true
+  - pattern: "DROP\\s+DATABASE"
+    reason: "SQL drop database"
+  - pattern: "aws\\s+s3\\s+rm\\s+--recursive"
+    reason: "Recursive S3 delete"
+  - pattern: "docker\\s+system\\s+prune"
+    reason: "Docker system prune"
+    ask: true
+  - pattern: "chmod\\s+-R\\s+777"
+    reason: "Insecure recursive permissions"
+    ask: true
+  - pattern: ":\\(\\)\\s*\\{\\s*:|\\.&\\s*\\}"
+    reason: "Fork bomb pattern"
+  - pattern: "mkfs\\."
+    reason: "Filesystem format"
+  - pattern: "dd\\s+.*of=/dev/"
+    reason: "Raw device write"
+
+# Zero access paths — block all reads and writes
+zeroAccessPaths:
+  - "~/.ssh/"
+  - "~/.gnupg/"
+  - "~/.aws/"
+  - "*.pem"
+  - "*.key"
+  - ".env.production"
+  - ".env.local"
+
+# Read-only paths — block writes but allow reads
+readOnlyPaths:
+  - "/etc/"
+  - "package-lock.json"
+  - "yarn.lock"
+  - "pnpm-lock.yaml"
+
+# No-delete paths — allow modifications but block deletion
+noDeletePaths:
+  - ".git/"
+  - "Dockerfile"
+  - "docker-compose.yml"
+  - "README.md"
+  - "LICENSE"

@@ -1,6 +1,7 @@
 // Pi Network — Task envelope + chain of custody
 
 import type { TaskPriority, TaskStatus, TaskMode } from "./config";
+import { ulid } from "./ulid";
 
 export interface ChainHop {
   agent: string;
@@ -34,6 +35,9 @@ export interface TaskEnvelope {
   requiredSecrets?: string[];
   partialWork?: string;
   priority: TaskPriority;
+  hops: number;        // Hop count for loop prevention (MAX_HOPS=5)
+  conversationId?: string;  // Thread conversations across hops
+  responseSchema?: object | null;  // Optional JSON Schema for structured replies
   userId?: string;
   queuedAt?: number;
   startedAt?: number;
@@ -66,7 +70,7 @@ export interface FileAttachment {
 }
 
 export function generateId(): string {
-  return `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return ulid();
 }
 
 export function createEnvelope(params: {
@@ -110,6 +114,9 @@ export function createEnvelope(params: {
     projectContext: params.projectContext,
     requiredSecrets: params.requiredSecrets,
     priority: params.priority || "normal",
+    hops: (params as any).hops || 0,
+    conversationId: (params as any).conversationId,
+    responseSchema: (params as any).responseSchema ?? null,
     userId: params.userId,
     queuedAt: now,
   };

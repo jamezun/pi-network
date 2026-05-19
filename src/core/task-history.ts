@@ -45,10 +45,43 @@ export function readHistory(filters?: {
   if (!existsSync(path)) return [];
 
   const content = readFileSync(path, "utf8");
-  let entries: TaskHistoryEntry[] = content
+  const allLines = content
     .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => JSON.parse(line));
+    .filter((line) => line.trim());
+
+  // Build status update map: taskId -> latest status
+  const statusUpdates: Map<string, { status: TaskStatus; resultSummary?: string; completedAt?: number }> = new Map();
+  const rawEntries: TaskHistoryEntry[] = [];
+
+  for (const line of allLines) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed._type === "status_update") {
+        const existing = statusUpdates.get(parsed.taskId);
+        if (!existing || parsed.timestamp > (existing as any).timestamp) {
+          statusUpdates.set(parsed.taskId, {
+            status: parsed.status,
+            resultSummary: parsed.resultSummary,
+            completedAt: parsed.completedAt,
+          });
+        }
+      } else {
+        rawEntries.push(parsed as TaskHistoryEntry);
+      }
+    } catch {}
+  }
+
+  // Apply status updates to entries
+  for (const entry of rawEntries) {
+    const update = statusUpdates.get(entry.taskId);
+    if (update) {
+      entry.status = update.status;
+      if (update.resultSummary) entry.resultSummary = update.resultSummary;
+      if (update.completedAt) entry.completedAt = update.completedAt;
+    }
+  }
+
+  let entries = rawEntries;
 
   if (filters?.status) entries = entries.filter((e) => e.status === filters.status);
   if (filters?.peer) entries = entries.filter((e) => e.peer === filters.peer);
@@ -63,26 +96,19 @@ export function readHistory(filters?: {
 }
 
 export function updateHistoryStatus(taskId: string, status: TaskStatus, resultSummary?: string): void {
+  // Append-only: add a status_update line instead of rewriting the whole file.
+  // This is O(1) instead of O(n²) for large histories.
   const path = getHistoryPath();
-  if (!existsSync(path)) return;
-
-  const lines = readFileSync(path, "utf8")
-    .split("\n")
-    .filter((line) => line.trim());
-
-  const updated = lines.map((line) => {
-    const entry = JSON.parse(line);
-    if (entry.taskId === taskId) {
-      entry.status = status;
-      if (resultSummary) entry.resultSummary = resultSummary;
-      if (status === "completed" || status === "failed" || status === "killed") {
-        entry.completedAt = Date.now();
-      }
-    }
-    return JSON.stringify(entry);
-  });
-
-  writeFileSync(path, updated.join("\n") + "\n");
+  const entry = {
+    _type: "status_update",
+    taskId,
+    status,
+    resultSummary: resultSummary || undefined,
+    completedAt: ["completed", "failed", "killed"].includes(status) ? Date.now() : undefined,
+    timestamp: Date.now(),
+  };
+  const line = JSON.stringify(entry) + "\n";
+  writeFileSync(path, line, { flag: "a" });
 }
 
 export function formatHistory(entries: TaskHistoryEntry[]): string {

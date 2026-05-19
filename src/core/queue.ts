@@ -57,10 +57,19 @@ export function readAllOutbox(): Record<string, TaskEnvelope[]> {
 export function removeFromOutbox(peer: string, taskId: string): void {
   const tasks = readOutbox(peer).filter((t) => t.taskId !== taskId);
   const filePath = getOutboxPath(peer);
+  const tmpPath = filePath + ".tmp";
   if (tasks.length === 0) {
     if (existsSync(filePath)) unlinkSync(filePath);
   } else {
-    writeFileSync(filePath, tasks.map((t) => JSON.stringify(t)).join("\n") + "\n");
+    // Atomic write: .tmp then rename
+    const data = tasks.map((t) => JSON.stringify(t)).join("\n") + "\n";
+    writeFileSync(tmpPath, data, "utf8");
+    try {
+      const { renameSync } = require("node:fs");
+      renameSync(tmpPath, filePath);
+    } catch {
+      writeFileSync(filePath, data, "utf8");
+    }
   }
 }
 

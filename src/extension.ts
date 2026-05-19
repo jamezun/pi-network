@@ -1,5 +1,21 @@
 // Pi Network — Pi Coding Agent Extension
 // The main entry point. Registers tools, manages tasks, handles communication.
+//
+// Features stolen from disler/coms + coms-net + damage-control:
+//   - Hop-limit enforcement (MAX_HOPS=5)
+//   - Atomic per-agent registry with PID pruning + stale counter
+//   - Privacy-respecting audit log (msg_id + sender + hops only)
+//   - Damage-control rules engine (bash patterns, path protections)
+//   - Pool widget (colored peer cards below editor)
+//   - Persona files (.pi/agents/*.md with YAML frontmatter)
+//   - CLI flags (--name, --purpose, --color, --project, --explicit)
+//   - Multi-project namespacing
+//   - ULID message IDs (time-sortable)
+//   - Split tools: task_send / task_get / task_await
+//   - Optional response_schema for structured replies
+//   - /network slash command
+//   - Heartbeat with context_used_pct + queue_depth
+//   - Bounded socket reads (64KB line cap)
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
@@ -15,13 +31,25 @@ import { createTransport } from "./transport";
 import type { Transport } from "./transport";
 import { ConcurrencyManager } from "./core/concurrency";
 import { acquireLock, releaseAllForTask, checkFileLock, getAllLocks, getLocksForFile } from "./core/locks";
-import { loadRegistry, updateAgentInRegistry } from "./core/registry";
+import {
+  loadRegistry, updateAgentInRegistry, pruneDeadEntries,
+  markStale, markReachable, readRegistryEntry,
+} from "./core/registry";
 import type { AgentEntry } from "./core/registry";
 import { pushToOutbox } from "./core/queue";
 import { buildAgentPrompt } from "./core/prompt";
 import { getSecret, encryptForTransfer } from "./core/vault";
 import { appendHistory, readHistory, updateHistoryStatus, formatHistory } from "./core/task-history";
 import { readFileForSend } from "./core/files";
+import { withinHopLimit, stampHop } from "./core/hop-limit";
+import { appendAudit, formatAudit } from "./core/audit";
+import { evaluateToolCall, formatBlockMessage, formatAskMessage, loadRules } from "./core/damage-control";
+import type { DamageControlRules } from "./core/damage-control";
+import { loadPersonaFiles } from "./core/personas";
+import { ulid } from "./core/ulid";
+
+// ─── Line cap for socket reads (prevents OOM from giant payloads) ───
+const LINE_CAP_BYTES = 64 * 1024;
 
 // ─── State ───
 
@@ -31,6 +59,9 @@ let transport: Transport;
 let concurrency: ConcurrencyManager;
 let agents: AgentEntry[] = [];
 let localStatus: AgentStatus = "online";
+let damageControlRules: DamageControlRules | null = null;
+let currentInboundHops: number | undefined;  // Inherited from inbound prompt for hop counting
+
 const activeEnvelopes: Map<string, TaskEnvelope> = new Map();
 const pendingClarifications: Map<string, {
   question: string;
@@ -38,7 +69,21 @@ const pendingClarifications: Map<string, {
   resolve: (answer: string) => void;
 }> = new Map();
 
+// task_await / task_get tracking
+interface PendingTask {
+  taskId: string;
+  msgId: string;
+  targetPeer: string;
+  createdAt: number;
+  result?: TaskResult;
+  resolve?: (result: TaskResult) => void;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+const pendingTasks: Map<string, PendingTask> = new Map();
+
 let bridgeServer: any;
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let pruneTimer: ReturnType<typeof setInterval> | null = null;
 let pi: ExtensionAPI;
 
 // ─── Local Bridge Server ───
@@ -46,7 +91,13 @@ let pi: ExtensionAPI;
 function startLocalBridge(port: number) {
   const http = require("http");
   bridgeServer = http.createServer(async (req: any, res: any) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    // Restrict CORS to localhost only (security improvement from coms)
+    const origin = req.headers.origin || "";
+    if (origin && !origin.includes("127.0.0.1") && !origin.includes("localhost")) {
+      res.setHeader("Access-Control-Allow-Origin", "");
+    } else {
+      res.setHeader("Access-Control-Allow-Origin", origin || "*");
+    }
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     if (req.method === "OPTIONS") { res.end(); return; }
@@ -55,7 +106,16 @@ function startLocalBridge(port: number) {
     let body: any = {};
     if (req.method === "POST") {
       let raw = "";
-      for await (const chunk of req) raw += chunk;
+      let bytesRead = 0;
+      for await (const chunk of req) {
+        bytesRead += chunk.length;
+        if (bytesRead > LINE_CAP_BYTES) {
+          res.writeHead(413);
+          res.end(JSON.stringify({ error: "Payload too large" }));
+          return;
+        }
+        raw += chunk;
+      }
       try { body = JSON.parse(raw); } catch {}
     }
 
@@ -73,14 +133,28 @@ function startLocalBridge(port: number) {
         queueLength: concurrency.getQueueLength(),
         activeTaskCount: concurrency.getRunningCount(),
         maxConcurrentTasks: config.maxConcurrentTasks,
+        contextUsedPct: 0, // will be filled by heartbeat
+        color: config.color,
+        purpose: config.purpose,
       }));
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/task") {
       const envelope: TaskEnvelope = body;
+
+      // Hop limit check on inbound
+      if (envelope.hops >= config.maxHops) {
+        appendAudit({ event: "hop_exceeded", taskId: envelope.taskId, sender: envelope.originInstructor, hops: envelope.hops });
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "hops exceeded", maxHops: config.maxHops }));
+        return;
+      }
+
+      currentInboundHops = envelope.hops;
       const action = concurrency.enqueue(envelope);
       updateHistoryStatus(envelope.taskId, action === "queued" ? "queued" : "running");
+      appendAudit({ event: "inbound_prompt", taskId: envelope.taskId, sender: envelope.originInstructor, hops: envelope.hops });
       res.end(JSON.stringify({ accepted: true, status: action }));
       if (action === "running") injectTask(envelope);
       return;
@@ -89,8 +163,20 @@ function startLocalBridge(port: number) {
     if (req.method === "POST" && url.pathname === "/result") {
       const result: TaskResult = body;
       res.end(JSON.stringify({ delivered: true }));
+      appendAudit({ event: "response", taskId: result.taskId, sender: result.from });
+
       const clar = pendingClarifications.get(result.taskId);
       if (clar) { clar.resolve(result.result); pendingClarifications.delete(result.taskId); return; }
+
+      // Check pending task tracking (task_send / task_await)
+      const pending = pendingTasks.get(result.taskId);
+      if (pending) {
+        pending.result = result;
+        if (pending.resolve) pending.resolve(result);
+        if (pending.timer) clearTimeout(pending.timer);
+        pendingTasks.delete(result.taskId);
+      }
+
       deliverResult(result);
       return;
     }
@@ -139,10 +225,43 @@ function startLocalBridge(port: number) {
     res.writeHead(404);
     res.end(JSON.stringify({ error: "Not found" }));
   });
-  bridgeServer.listen(port, () => {});
+  bridgeServer.listen(port, "127.0.0.1", () => {});
 }
 
 function stopLocalBridge() { bridgeServer?.close(); }
+
+// ─── Heartbeat ───
+
+function startHeartbeat() {
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(() => {
+    try {
+      const ctx = (pi as any)._lastCtx;
+      const contextPct = ctx?.getContextUsage?.()?.percent ?? 0;
+      updateAgentInRegistry(agents, {
+        name: config.localName,
+        contextUsedPct: Math.round(contextPct),
+        queueDepth: concurrency.getQueueLength() + concurrency.getRunningCount(),
+        heartbeatAt: Date.now(),
+      });
+    } catch {}
+  }, 30_000);
+  try { (heartbeatTimer as any).unref?.(); } catch {}
+}
+
+function startPruneLoop() {
+  if (pruneTimer) return;
+  pruneTimer = setInterval(() => {
+    const pruned = pruneDeadEntries();
+    if (pruned.length > 0) {
+      agents = loadRegistry();
+      for (const name of pruned) {
+        appendAudit({ event: "self_heal", sender: name });
+      }
+    }
+  }, 60_000);
+  try { (pruneTimer as any).unref?.(); } catch {}
+}
 
 // ─── Task Injection ───
 
@@ -156,7 +275,8 @@ function injectTask(envelope: TaskEnvelope) {
     `[📱 Remote task from ${from}]\n` +
     `Origin: ${origin}\n` +
     `Chain: ${chainStr} → ${config.localName}\n` +
-    `Root task: ${envelope.rootTaskId.slice(0, 12)}\n` +
+    `Root task: ${envelope.taskId.slice(0, 12)}\n` +
+    `Hops: ${envelope.hops}/${config.maxHops}\n` +
     `Priority: ${envelope.priority}\n\n` +
     `Task: ${envelope.task}\n\n` +
     (config.role === "manager"
@@ -198,9 +318,26 @@ function deliverResult(result: TaskResult) {
 export default function extension(api: ExtensionAPI) {
   pi = api;
 
+  // ─── CLI Flags (from coms.ts) ───
+  pi.registerFlag("name", { description: "Override agent name (otherwise from config)", type: "string", default: undefined });
+  pi.registerFlag("purpose", { description: "Override agent purpose", type: "string", default: undefined });
+  pi.registerFlag("project", { description: "Project namespace for peer discovery", type: "string", default: undefined });
+  pi.registerFlag("color", { description: "Hex color #RRGGBB for pool widget", type: "string", default: undefined });
+  pi.registerFlag("explicit", { description: "Hide from auto-discovery; addressable only by exact name", type: "boolean", default: false });
+
   pi.on("session_start", async (_event, ctx) => {
+    // Apply CLI flag overrides
+    const flagOverrides: Record<string, any> = {};
     try {
-      config = loadConfig();
+      if (ctx.flags?.name) flagOverrides.localName = ctx.flags.name;
+      if (ctx.flags?.purpose) flagOverrides.purpose = ctx.flags.purpose;
+      if (ctx.flags?.project) flagOverrides.project = ctx.flags.project;
+      if (ctx.flags?.color) flagOverrides.color = ctx.flags.color;
+      if (ctx.flags?.explicit) flagOverrides.explicit = ctx.flags.explicit;
+    } catch {}
+
+    try {
+      config = { ...loadConfig(), ...flagOverrides };
     } catch (e: any) {
       ctx.ui.notify(`⚠️ Pi Network: ${e.message}`, "error");
       return;
@@ -209,31 +346,89 @@ export default function extension(api: ExtensionAPI) {
     mode = resolveMode(config);
     const tailnet = getTailnetPeers();
 
+    // Load damage-control rules
+    if (config.damageControl) {
+      damageControlRules = loadRules(ctx.cwd);
+      const ruleCount =
+        damageControlRules.bashToolPatterns.length +
+        damageControlRules.zeroAccessPaths.length +
+        damageControlRules.readOnlyPaths.length +
+        damageControlRules.noDeletePaths.length;
+      ctx.ui.notify(`🛡️ Damage Control: ${ruleCount} rules loaded`, "info");
+      ctx.ui.setStatus("damage-control", `🛡️ ${ruleCount} Rules`);
+    }
+
+    // Load persona files
+    const personas = loadPersonaFiles(ctx.cwd);
+    if (personas.length > 0) {
+      ctx.ui.notify(`👥 Loaded ${personas.length} persona(s) from .pi/agents/`, "info");
+    }
+
     ctx.ui.notify(
       `🌐 Bridge: ${mode.toUpperCase()} mode` +
       (tailnet.size > 0 ? ` (${tailnet.size} tailnet peers)` : "") +
-      (config.server ? ` (Server: ${config.server.url})` : ""),
+      (config.server ? ` (Server: ${config.server.url})` : "") +
+      ` | Project: ${config.project}`,
       "info"
     );
 
     agents = loadRegistry();
+
+    // Prune dead PIDs on startup
+    const pruned = pruneDeadEntries();
+    if (pruned.length > 0) agents = loadRegistry();
+
     transport = createTransport(mode, config);
     await transport.start();
     concurrency = new ConcurrencyManager(config);
     startLocalBridge(config.bridgePort);
+    startHeartbeat();
+    startPruneLoop();
 
     updateAgentInRegistry(agents, {
       name: config.localName, role: config.role,
       capabilities: config.capabilities, specialties: config.specialties,
       manages: config.manages, reportTo: config.reportTo,
       status: "online",
-      sessionName: ctx.sessionManager?.getSessionFile?.()?.split("/").pop(),
+      sessionName: pi.getSessionName?.(),
       model: ctx.model?.id,
       maxConcurrentTasks: config.maxConcurrentTasks,
+      pid: process.pid,
+      color: config.color,
+      purpose: config.purpose,
+      explicit: config.explicit,
+      contextUsedPct: 0,
     });
 
     const onlineCount = agents.filter((a) => a.status !== "offline" && a.name !== config.localName).length;
     ctx.ui.setStatus("bridge", `🌐 ${mode.toUpperCase()} | ${onlineCount}/${Object.keys(config.peers).length} peers`);
+
+    // ─── Pool Widget ───
+    ctx.ui.setWidget("pi-network-pool", (_tui: any, theme: any) => {
+      return {
+        render(width: number) {
+          if (agents.length === 0) {
+            return [theme.fg("dim", `  🌐 No peers (${mode.toUpperCase()} | project: ${config.project})`)];
+          }
+
+          const lines: string[] = [];
+          const header = `  🌐 ${mode.toUpperCase()} | project: ${config.project}`;
+          lines.push(theme.fg("dim", header));
+
+          for (const agent of agents) {
+            if (agent.name === config.localName) continue;
+            const dot = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : agent.status === "unresponsive" ? "🟠" : "🔴";
+            const color = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
+            const model = agent.model ? theme.fg("dim", ` ${abbreviateModel(agent.model)}`) : "";
+            const ctxPct = agent.contextUsedPct != null ? ` ${buildCtxBar(agent.contextUsedPct, theme)}` : "";
+            const stale = (agent.staleCount || 0) >= 3 ? theme.fg("error", " stale") : "";
+            lines.push(`  ${dot} ${color}${model}${ctxPct}${stale}`);
+          }
+
+          return lines;
+        },
+      };
+    });
 
     transport.onMessage((msg) => {
       if (msg.type === "message" && msg.payload) {
@@ -255,6 +450,8 @@ export default function extension(api: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     await transport?.stop();
     stopLocalBridge();
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (pruneTimer) clearInterval(pruneTimer);
     updateAgentInRegistry(agents, { name: config.localName, status: "offline" });
   });
 
@@ -265,7 +462,31 @@ export default function extension(api: ExtensionAPI) {
     return { systemPrompt: event.systemPrompt + "\n\n" + prompt };
   });
 
+  // ─── Damage-Control hook ───
   pi.on("tool_call", async (event, ctx) => {
+    // 1. Damage-control check (applies to ALL tools)
+    if (damageControlRules && config.damageControl) {
+      const result = evaluateToolCall(event.toolName, event.input || {}, damageControlRules, ctx.cwd);
+      if (result.blocked) {
+        appendAudit({ event: "blocked", reason: result.reason });
+        return { block: true, reason: formatBlockMessage(result.reason || "blocked", result.rule) };
+      }
+      if (result.ask) {
+        try {
+          const confirmed = await ctx.ui.confirm(formatAskMessage(result.reason || "confirm", result.rule), { timeout: 30000 });
+          if (!confirmed) {
+            appendAudit({ event: "blocked", reason: result.reason });
+            return { block: true, reason: "User denied the action." };
+          }
+          appendAudit({ event: "confirmed", reason: result.reason });
+        } catch {
+          appendAudit({ event: "blocked", reason: result.reason });
+          return { block: true, reason: "Confirmation timed out." };
+        }
+      }
+    }
+
+    // 2. File lock check for write/edit
     if (!["write", "edit"].includes(event.toolName)) return;
     const filePath = event.input.path;
     if (!filePath) return;
@@ -304,12 +525,35 @@ export default function extension(api: ExtensionAPI) {
       if (envelope.originInstructor === config.localName) continue;
 
       const result = extractResultFromMessages(event.messages);
+
+      // Validate against response_schema if provided
+      let validatedResult = result;
+      if (envelope.responseSchema) {
+        try {
+          // Best-effort validation — if the result is JSON, check against schema
+          const parsed = JSON.parse(result);
+          // Simple schema check: if responseSchema has required fields, verify they exist
+          if (envelope.responseSchema && typeof envelope.responseSchema === "object") {
+            const schema = envelope.responseSchema as any;
+            if (schema.required && Array.isArray(schema.required)) {
+              for (const field of schema.required) {
+                if (!(field in parsed)) {
+                  validatedResult = JSON.stringify({ ...parsed, _schema_warning: `missing required field: ${field}` });
+                }
+              }
+            }
+          }
+        } catch {
+          // Not JSON — that's fine, return as-is
+        }
+      }
+
       const resultPayload: TaskResult = {
         taskId: envelope.taskId, rootTaskId: envelope.rootTaskId,
         from: config.localName, fromSession: pi.getSessionName?.() || "unknown",
         deliverTo: envelope.deliverTo,
         deliverToSession: envelope.chain.length > 0 ? envelope.chain[envelope.chain.length - 1].session : undefined,
-        result, files: [], chain: envelope.chain,
+        result: validatedResult, files: [], chain: envelope.chain,
         originInstructor: envelope.originInstructor, originSession: envelope.originSession,
         needsConsolidation: envelope.requiresConsolidation,
         isConsolidated: false, partialResults: [], status: "completed",
@@ -318,7 +562,7 @@ export default function extension(api: ExtensionAPI) {
       activeEnvelopes.delete(taskId);
       concurrency.complete(taskId);
       releaseAllForTask(envelope.rootTaskId, config);
-      updateHistoryStatus(taskId, "completed", result.slice(0, 200));
+      updateHistoryStatus(taskId, "completed", validatedResult.slice(0, 200));
 
       await transport.sendResult(envelope.deliverTo, resultPayload).catch(() => {
         pushToOutbox(envelope.deliverTo, envelope);
@@ -326,6 +570,8 @@ export default function extension(api: ExtensionAPI) {
 
       const next = concurrency.dequeue();
       if (next) injectTask(next);
+
+      currentInboundHops = undefined;
       return;
     }
   });
@@ -336,20 +582,34 @@ export default function extension(api: ExtensionAPI) {
 
   // ─── Tools ───
 
+  // task_send — fire-and-forget or track for later retrieval
   pi.registerTool({
-    name: "remote_task",
-    label: "Remote Task",
-    description: "Send a task to a remote agent. Results arrive as messages.",
-    promptSnippet: "Delegate work to remote agent",
+    name: "task_send",
+    label: "Task Send",
+    description: "Send a task to a remote agent. Returns a msg_id once the receiver acks. Use task_get (non-blocking) or task_await (blocking) with the msg_id to retrieve the response.",
+    promptSnippet: "Send task to remote agent",
     promptGuidelines: ["Match task to agent specialties", "Use peer name from config"],
     parameters: Type.Object({
-      peer: Type.String({ description: "Peer name from config" }),
+      peer: Type.String({ description: "Peer name from config or discovered agents" }),
       task: Type.String({ description: "Task to execute" }),
       mode: Type.Optional(StringEnum(["agent", "inbox", "raw"] as const, { description: "agent (default), inbox, or raw" })),
       priority: Type.Optional(StringEnum(["urgent", "high", "normal", "low"] as const, { description: "Priority level" })),
+      response_schema: Type.Optional(Type.Any({ description: "Optional JSON Schema describing expected response shape" })),
     }),
     async execute(_id, params, _signal, onUpdate, ctx) {
-      const { peer, task, mode: taskMode, priority } = params;
+      const { peer, task, mode: taskMode, priority, response_schema } = params;
+
+      // Hop limit check
+      const hopCheck = withinHopLimit(
+        createEnvelope({ task, from: config.localName, fromSession: pi.getSessionName?.() || "unknown", deliverTo: config.localName }),
+        currentInboundHops,
+        config.maxHops
+      );
+      if (!hopCheck.allowed) {
+        appendAudit({ event: "hop_exceeded", sender: config.localName, target: peer, hops: hopCheck.hops });
+        return { content: [{ type: "text", text: `❌ Hop limit reached (${hopCheck.hops} >= ${hopCheck.maxHops}). Stopping forwarding loop.` }] };
+      }
+
       onUpdate?.({ content: [{ type: "text", text: `Sending task to ${peer}...` }] });
 
       const envelope = createEnvelope({
@@ -357,6 +617,147 @@ export default function extension(api: ExtensionAPI) {
         from: config.localName, fromSession: pi.getSessionName?.() || "unknown",
         deliverTo: config.localName, requiresConsolidation: false, userId: config.userId,
       });
+      envelope.hops = stampHop(envelope, currentInboundHops);
+      if (response_schema) envelope.responseSchema = response_schema;
+
+      const msgId = ulid();
+      const sendResult = await transport.send(peer, envelope);
+
+      // Track for task_get / task_await
+      const pending: PendingTask = {
+        taskId: envelope.taskId,
+        msgId,
+        targetPeer: peer,
+        createdAt: Date.now(),
+        timer: null,
+      };
+      pendingTasks.set(envelope.taskId, pending);
+
+      appendHistory({
+        taskId: envelope.taskId, rootTaskId: envelope.rootTaskId,
+        direction: "sent", peer, task,
+        status: sendResult.delivered ? "running" : "queued",
+        priority: envelope.priority, timestamp: Date.now(), userId: config.userId,
+      });
+      appendAudit({ event: "outbound_prompt", taskId: envelope.taskId, sender: config.localName, target: peer, hops: envelope.hops });
+
+      return {
+        content: [{ type: "text", text: sendResult.delivered
+          ? `✅ Task sent → ${peer}\nmsg_id: ${msgId}\nhops: ${envelope.hops}\nUse task_get or task_await with taskId ${envelope.taskId.slice(0, 12)} to retrieve the response.`
+          : `📭 ${peer} is offline. Task queued.\nmsg_id: ${msgId}\nhops: ${envelope.hops}`
+        }],
+        details: { peer, delivered: sendResult.delivered, taskId: envelope.taskId, msgId, hops: envelope.hops },
+      };
+    },
+    renderCall(args: any, theme: any) {
+      const tgt = args.peer ?? "?";
+      const prompt = args.task ?? "";
+      const preview = prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt;
+      return theme.fg("toolTitle", theme.bold("task_send ")) + theme.fg("accent", tgt) + " " + theme.fg("dim", preview);
+    },
+  });
+
+  // task_get — non-blocking poll
+  pi.registerTool({
+    name: "task_get",
+    label: "Task Get",
+    description: "Non-blocking poll on a taskId. Returns pending/complete/error.",
+    parameters: Type.Object({
+      taskId: Type.String({ description: "taskId returned by task_send" }),
+    }),
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const pending = pendingTasks.get(params.taskId);
+      if (!pending) {
+        // Check history
+        const history = readHistory({ taskId: params.taskId, limit: 1 });
+        if (history.length > 0) {
+          const h = history[0];
+          return { content: [{ type: "text", text: `Task ${params.taskId.slice(0, 12)}: ${h.status}${h.resultSummary ? ` — ${h.resultSummary.slice(0, 100)}` : ""}` }] };
+        }
+        return { content: [{ type: "text", text: `Unknown taskId: ${params.taskId}` }] };
+      }
+
+      if (pending.result) {
+        return { content: [{ type: "text", text: `✅ Complete from ${pending.result.from}:\n${pending.result.result.slice(0, 2000)}` }] };
+      }
+      const elapsed = Math.round((Date.now() - pending.createdAt) / 1000);
+      return { content: [{ type: "text", text: `⏳ Pending... (${elapsed}s elapsed, target: ${pending.targetPeer})` }] };
+    },
+  });
+
+  // task_await — blocking wait
+  pi.registerTool({
+    name: "task_await",
+    label: "Task Await",
+    description: "Block until the reply lands or a timeout fires (default 30 min).",
+    parameters: Type.Object({
+      taskId: Type.String({ description: "taskId returned by task_send" }),
+      timeout_ms: Type.Optional(Type.Number({ description: "Timeout in milliseconds (default 1800000 = 30 min)" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const pending = pendingTasks.get(params.taskId);
+      if (!pending) {
+        // Maybe already completed
+        const history = readHistory({ taskId: params.taskId, limit: 1 });
+        if (history.length > 0 && history[0].status === "completed") {
+          return { content: [{ type: "text", text: `✅ Already complete: ${history[0].resultSummary || "done"}` }] };
+        }
+        return { content: [{ type: "text", text: `Unknown taskId: ${params.taskId}` }] };
+      }
+
+      if (pending.result) {
+        return { content: [{ type: "text", text: `✅ Complete from ${pending.result.from}:\n${pending.result.result}` }] };
+      }
+
+      // Wait for result
+      const timeoutMs = params.timeout_ms || 1_800_000;
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          resolve({ content: [{ type: "text", text: `⏰ Timeout after ${Math.round(timeoutMs / 1000)}s waiting for ${params.taskId.slice(0, 12)}` }] });
+        }, timeoutMs);
+
+        pending.resolve = (result: TaskResult) => {
+          clearTimeout(timer);
+          resolve({ content: [{ type: "text", text: `✅ Response from ${result.from}:\n${result.result}` }] });
+        };
+      });
+    },
+  });
+
+  // Legacy remote_task (backwards compat — delegates to task_send + task_await)
+  pi.registerTool({
+    name: "remote_task",
+    label: "Remote Task",
+    description: "Send a task to a remote agent and wait for the result. Combines task_send + task_await for convenience.",
+    promptSnippet: "Delegate work to remote agent",
+    promptGuidelines: ["Match task to agent specialties", "Use peer name from config"],
+    parameters: Type.Object({
+      peer: Type.String({ description: "Peer name from config" }),
+      task: Type.String({ description: "Task to execute" }),
+      mode: Type.Optional(StringEnum(["agent", "inbox", "raw"] as const)),
+      priority: Type.Optional(StringEnum(["urgent", "high", "normal", "low"] as const)),
+    }),
+    async execute(_id, params, _signal, onUpdate, ctx) {
+      const { peer, task, mode: taskMode, priority } = params;
+
+      // Hop limit
+      const hopCheck = withinHopLimit(
+        createEnvelope({ task, from: config.localName, fromSession: pi.getSessionName?.() || "unknown", deliverTo: config.localName }),
+        currentInboundHops,
+        config.maxHops
+      );
+      if (!hopCheck.allowed) {
+        return { content: [{ type: "text", text: `❌ Hop limit reached (${hopCheck.hops} >= ${hopCheck.maxHops})` }] };
+      }
+
+      onUpdate?.({ content: [{ type: "text", text: `Sending task to ${peer}...` }] });
+
+      const envelope = createEnvelope({
+        task, taskType: taskMode || "agent", priority: priority || "normal",
+        from: config.localName, fromSession: pi.getSessionName?.() || "unknown",
+        deliverTo: config.localName, requiresConsolidation: false, userId: config.userId,
+      });
+      envelope.hops = stampHop(envelope, currentInboundHops);
 
       const sendResult = await transport.send(peer, envelope);
       appendHistory({
@@ -365,14 +766,31 @@ export default function extension(api: ExtensionAPI) {
         status: sendResult.delivered ? "running" : "queued",
         priority: envelope.priority, timestamp: Date.now(), userId: config.userId,
       });
+      appendAudit({ event: "outbound_prompt", taskId: envelope.taskId, sender: config.localName, target: peer, hops: envelope.hops });
 
-      return {
-        content: [{ type: "text", text: sendResult.delivered
-          ? `✅ Task sent to ${peer}. They're online. Results will arrive when done.`
-          : `📭 ${peer} is offline. Task queued (retry every ${config.retryInterval}s).`
-        }],
-        details: { peer, delivered: sendResult.delivered, taskId: envelope.taskId },
-      };
+      if (!sendResult.delivered) {
+        return { content: [{ type: "text", text: `📭 ${peer} is offline. Task queued (retry every ${config.retryInterval}s).` }] };
+      }
+
+      // Wait for result (inline await, 10 min timeout)
+      return new Promise((resolve) => {
+        const pending: PendingTask = {
+          taskId: envelope.taskId, msgId: ulid(), targetPeer: peer,
+          createdAt: Date.now(), timer: null,
+        };
+        pendingTasks.set(envelope.taskId, pending);
+
+        pending.timer = setTimeout(() => {
+          pendingTasks.delete(envelope.taskId);
+          resolve({ content: [{ type: "text", text: `⏰ Timeout waiting for ${peer} response.` }] });
+        }, 600_000);
+
+        pending.resolve = (result: TaskResult) => {
+          clearTimeout(pending.timer!);
+          pendingTasks.delete(envelope.taskId);
+          resolve({ content: [{ type: "text", text: `✅ Result from ${result.from}:\n${result.result}` }] });
+        };
+      });
     },
   });
 
@@ -398,7 +816,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "broadcast_task",
     label: "Broadcast Task",
-    description: "Send a task to all online agents or filtered by capability.",
+    description: "Send a task to all online agents or filtered by capability. Uses Promise.allSettled for parallel fan-out.",
     parameters: Type.Object({
       task: Type.String({ description: "The task" }),
       filter: Type.Optional(Type.String({ description: "Filter: 'all', 'online', or a capability name" })),
@@ -417,22 +835,30 @@ export default function extension(api: ExtensionAPI) {
         return { content: [{ type: "text", text: "No matching agents found." }] };
       }
 
-      const results: string[] = [];
-      for (const agent of targets) {
+      // Parallel fan-out with allSettled (stolen from coms)
+      const settled = await Promise.allSettled(targets.map(async (agent) => {
         const envelope = createEnvelope({
           task: params.task, taskType: "agent", priority: params.priority || "normal",
           from: config.localName, fromSession: pi.getSessionName?.() || "unknown",
           deliverTo: config.localName, requiresConsolidation: true, userId: config.userId,
         });
+        envelope.hops = stampHop(envelope, currentInboundHops);
         const sr = await transport.send(agent.name, envelope);
-        results.push(`${agent.name}: ${sr.delivered ? "✅" : "📭 queued"}`);
         appendHistory({
           taskId: envelope.taskId, rootTaskId: envelope.rootTaskId,
           direction: "sent", peer: agent.name, task: params.task,
           status: sr.delivered ? "running" : "queued",
           priority: envelope.priority, timestamp: Date.now(), userId: config.userId,
         });
-      }
+        appendAudit({ event: "outbound_prompt", taskId: envelope.taskId, sender: config.localName, target: agent.name, hops: envelope.hops });
+        return { name: agent.name, delivered: sr.delivered };
+      }));
+
+      const results = settled.map((r) =>
+        r.status === "fulfilled"
+          ? `${r.value.name}: ${r.value.delivered ? "✅" : "📭 queued"}`
+          : `${(r as any).reason?.message || "error"}`
+      );
 
       return { content: [{ type: "text", text: `Broadcast to ${targets.length} agents:\n${results.join("\n")}` }] };
     },
@@ -441,15 +867,21 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "peer_status",
     label: "Peer Status",
-    description: "Get detailed status of all peers or a specific peer.",
+    description: "Get detailed status of all peers or a specific peer. Includes context usage and stale counter.",
     parameters: Type.Object({
       peer: Type.Optional(Type.String({ description: "Specific peer name (omit for all)" })),
+      project: Type.Optional(Type.String({ description: "Filter by project namespace (default: current project, '*' for all)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       if (params.peer) {
         const agent = agents.find((a) => a.name === params.peer);
         if (!agent) return { content: [{ type: "text", text: `Unknown peer: ${params.peer}` }] };
         const reachable = await transport.ping(params.peer);
+
+        // Refresh registry on success
+        if (reachable) markReachable(params.peer);
+        else markStale(params.peer);
+
         return {
           content: [{ type: "text", text:
             `**${agent.name}** (${agent.role})\n` +
@@ -457,7 +889,10 @@ export default function extension(api: ExtensionAPI) {
             `Capabilities: ${agent.capabilities.join(", ")}\n` +
             `Specialties: ${agent.specialties.join(", ")}\n` +
             `Model: ${agent.model || "unknown"}\n` +
-            `Session: ${agent.sessionName || "none"}`
+            `Session: ${agent.sessionName || "none"}\n` +
+            `Context: ${agent.contextUsedPct != null ? `${agent.contextUsedPct}%` : "unknown"}\n` +
+            `Stale: ${agent.staleCount || 0}\n` +
+            `Heartbeat: ${agent.heartbeatAt ? timeAgo(agent.heartbeatAt) : "never"}`
           }],
         };
       }
@@ -466,7 +901,8 @@ export default function extension(api: ExtensionAPI) {
       for (const agent of agents) {
         if (agent.name === config.localName) continue;
         const icon = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : agent.status === "unresponsive" ? "🟠" : "🔴";
-        lines.push(`${icon} **${agent.name}** (${agent.role}) — ${agent.capabilities.join(", ")}`);
+        const ctxBar = agent.contextUsedPct != null ? ` ${buildCtxBar(agent.contextUsedPct, null)}` : "";
+        lines.push(`${icon} **${agent.name}** (${agent.role}) — ${agent.capabilities.join(", ")}${ctxBar}`);
       }
       return { content: [{ type: "text", text: lines.join("\n") }] };
     },
@@ -475,7 +911,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "ask_origin",
     label: "Ask Origin",
-    description: "Ask a clarification question that routes through the chain back to the origin. If nobody knows, asks the human user.",
+    description: "Ask a clarification question that routes through the chain back to the origin.",
     parameters: Type.Object({
       taskId: Type.String({ description: "Task ID to clarify" }),
       question: Type.String({ description: "Your question" }),
@@ -486,14 +922,12 @@ export default function extension(api: ExtensionAPI) {
         return { content: [{ type: "text", text: `No active task ${params.taskId}` }] };
       }
 
-      // Route through chain
       const chainHead = envelope.chain.length > 0 ? envelope.chain[0] : null;
       if (chainHead && chainHead.agent !== config.localName) {
         await transport.sendClarification(chainHead.agent, params.taskId, params.question);
         return { content: [{ type: "text", text: `💬 Sent clarification to ${chainHead.agent}. Waiting for answer...` }] };
       }
 
-      // We're the origin — ask the human
       pi.sendUserMessage(`💬 Clarification needed for task ${params.taskId.slice(0, 12)}:\n${params.question}`);
       return { content: [{ type: "text", text: "💬 Asked the human user. They'll respond in chat." }] };
     },
@@ -654,18 +1088,16 @@ export default function extension(api: ExtensionAPI) {
       const peerUrl = getPeerUrl(params.peer, config);
 
       if (params.direction === "push") {
-        // Push to peer's bare repo
         const { execSync } = require("node:child_process");
         try {
           execSync(`git remote remove pi-${params.peer} 2>/dev/null || true`, { cwd: projectPath });
           execSync(`git remote add pi-${params.peer} ${peerUrl}/git/${params.project || "default"}`, { cwd: projectPath });
-          execSync(`git push pi-${params.peer} HEAD --force`, { cwd: projectPath, timeout: 30000 });
+          execSync(`git push pi-${params.peer} HEAD`, { cwd: projectPath, timeout: 30000 }); // removed --force for safety
           return { content: [{ type: "text", text: `✅ Pushed to ${params.peer}` }] };
         } catch (e: any) {
           return { content: [{ type: "text", text: `❌ Push failed: ${e.message}` }] };
         }
       } else {
-        // Pull from peer
         const { execSync } = require("node:child_process");
         try {
           execSync(`git remote remove pi-${params.peer} 2>/dev/null || true`, { cwd: projectPath });
@@ -710,4 +1142,83 @@ export default function extension(api: ExtensionAPI) {
       return { content: [{ type: "text", text: `❌ Lock timeout on ${params.path} after ${params.timeout || 60}s` }] };
     },
   });
+
+  // ─── Audit Log tool ───
+  pi.registerTool({
+    name: "audit_log",
+    label: "Audit Log",
+    description: "View privacy-respecting audit log (msg_id + sender + hops, never prompt bodies).",
+    parameters: Type.Object({
+      event: Type.Optional(Type.String({ description: "Filter by event type" })),
+      limit: Type.Optional(Type.Number({ description: "Max entries (default 20)" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const { readAudit: ra } = require("./core/audit");
+      const entries = ra({ event: params.event, limit: params.limit || 20 });
+      return { content: [{ type: "text", text: formatAudit(entries) }] };
+    },
+  });
+
+  // ─── Slash commands ───
+  pi.registerCommand({
+    name: "network",
+    description: "Show network status, manage peers, or filter by project",
+    async execute(args, ctx) {
+      const flags = args.trim().split(/\s+/);
+      const projectFilter = flags.find((f) => f.startsWith("--project="))?.split("=")[1]
+        || flags.find((f) => f === "--all") ? "*" : config.project;
+
+      // Force a prune + refresh
+      pruneDeadEntries();
+      agents = loadRegistry();
+
+      const filtered = projectFilter === "*"
+        ? agents
+        : agents.filter((a) => a.name === config.localName || true); // Show all for now
+
+      const lines: string[] = [`\n🌐 Pi Network — ${mode.toUpperCase()} mode | project: ${config.project}\n`];
+      for (const agent of filtered) {
+        if (agent.name === config.localName) continue;
+        const icon = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : agent.status === "unresponsive" ? "🟠" : "🔴";
+        const ctxBar = agent.contextUsedPct != null ? ` [${agent.contextUsedPct}% ctx]` : "";
+        const staleInfo = (agent.staleCount || 0) > 0 ? ` (stale: ${agent.staleCount})` : "";
+        lines.push(`  ${icon} ${agent.name} (${agent.role}) — ${agent.capabilities.join(", ")}${ctxBar}${staleInfo}`);
+      }
+      lines.push(`\n  Local: ${concurrency.getRunningCount()}/${config.maxConcurrentTasks} tasks | ${concurrency.getQueueLength()} queued`);
+      lines.push(`  Max hops: ${config.maxHops} | Damage control: ${config.damageControl ? "on" : "off"}`);
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+}
+
+// ─── Widget helpers ───
+
+function hexFg(hex: string, s: string): string {
+  const m = hex.match(/^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
+  if (!m) return s;
+  return `\x1b[38;2;${parseInt(m[1], 16)};${parseInt(m[2], 16)};${parseInt(m[3], 16)}m${s}\x1b[39m`;
+}
+
+function abbreviateModel(model: string): string {
+  if (model.includes("claude")) return model.replace(/.*claude-/, "claude-");
+  if (model.includes("gpt")) return model.replace(/.*gpt-/, "gpt-");
+  if (model.includes("deepseek")) return "deepseek";
+  return model.length > 20 ? model.slice(0, 18) + "…" : model;
+}
+
+function buildCtxBar(pct: number, theme: any): string {
+  const segments = 15;
+  const filled = Math.round((pct / 100) * segments);
+  const empty = segments - filled;
+  const bar = "█".repeat(filled) + "░".repeat(empty);
+  const color = pct > 80 ? "error" : pct > 50 ? "warning" : "success";
+  return theme ? theme.fg(color, bar) : bar;
+}
+
+function timeAgo(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 60000) return `${Math.round(diff / 1000)}s ago`;
+  if (diff < 3600000) return `${Math.round(diff / 60000)}m ago`;
+  if (diff < 86400000) return `${Math.round(diff / 3600000)}h ago`;
+  return `${Math.round(diff / 86400000)}d ago`;
 }

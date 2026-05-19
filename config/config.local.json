@@ -4,6 +4,12 @@
   "role": "manager",
   "capabilities": ["coding", "architecture", "research"],
   "specialties": ["typescript", "python"],
+  "project": "default",
+  "maxHops": 5,
+  "damageControl": true,
+  "color": "#36F9F6",
+  "purpose": "Plans the work and delegates to workers",
+  "explicit": false,
   "peers": {
     "desktop": { "type": "pi" },
     "laptop":  { "type": "pi" }

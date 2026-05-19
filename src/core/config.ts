@@ -43,6 +43,12 @@ export interface BridgeConfig {
   maxQueueSize: number;
   maxConcurrentTasks: number;
   heartbeatTimeout: number;
+  maxHops: number;             // Max delegation hops (default 5)
+  project: string;             // Project namespace for discovery
+  damageControl: boolean;      // Enable damage-control rules engine
+  color?: string;              // Hex color for this agent in the pool widget
+  purpose?: string;            // Short purpose description shown in pool
+  explicit?: boolean;          // Hide from auto-discovery if true
   vaultKey?: string;
   userId?: string;
 }
@@ -84,6 +90,12 @@ export function loadConfig(): BridgeConfig {
     maxQueueSize: raw.maxQueueSize || 50,
     maxConcurrentTasks: raw.maxConcurrentTasks || 3,
     heartbeatTimeout: raw.heartbeatTimeout || 600,
+    maxHops: raw.maxHops || Number(process.env.PI_NETWORK_MAX_HOPS) || 5,
+    project: raw.project || process.env.PI_NETWORK_PROJECT || "default",
+    damageControl: raw.damageControl !== false,
+    color: raw.color,
+    purpose: raw.purpose,
+    explicit: raw.explicit || false,
     vaultKey: raw.vaultKey,
     userId: raw.userId,
   };

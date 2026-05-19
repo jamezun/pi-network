@@ -46,7 +46,7 @@ export function saveVault(data: VaultData, vaultKey?: string): void {
     throw new Error("vaultKey not configured. Add vaultKey to config.json");
   }
   const key = deriveKey(vaultKey);
-  const iv = randomBytes(16);
+  const iv = randomBytes(12); // AES-GCM spec: 12 bytes
   const cipher = createCipheriv(ALGORITHM, key, iv);
   const encrypted = Buffer.concat([cipher.update(JSON.stringify(data)), cipher.final()]);
   const authTag = cipher.getAuthTag();
@@ -81,7 +81,7 @@ export function listSecretNames(vaultKey?: string): string[] {
 
 export function encryptForTransfer(data: VaultData, vaultKey: string): string {
   const key = deriveKey(vaultKey);
-  const iv = randomBytes(16);
+  const iv = randomBytes(12); // AES-GCM spec: 12 bytes
   const cipher = createCipheriv(ALGORITHM, key, iv);
   const encrypted = Buffer.concat([cipher.update(JSON.stringify(data)), cipher.final()]);
   const authTag = cipher.getAuthTag();

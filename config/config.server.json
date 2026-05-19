@@ -5,6 +5,11 @@
   "capabilities": ["coding", "architecture", "research"],
   "specialties": ["typescript", "python", "system-design"],
   "manages": ["laptop", "vps"],
+  "project": "default",
+  "maxHops": 5,
+  "damageControl": true,
+  "color": "#36F9F6",
+  "purpose": "Plans the work and delegates to workers",
   "server": {
     "url": "https://bridge.example.com",
     "apiKey": "change-me-to-a-strong-random-secret"
