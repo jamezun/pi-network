@@ -1512,6 +1512,123 @@ Control your mesh from WhatsApp via Evolution API:
 
 ---
 
+## Git Sync — Cross-Machine Branch Coordination
+
+Automatically sync code across machines via git. Workers create branches, manager merges to main.
+
+### How it works
+
+```
+Laptop (manager)
+  │
+  ├── task_send("venus", "research topic A")     ← via pi-network
+  ├── task_send("hendry", "build feature X")     ← via pi-network
+  │
+Venus (desktop worker)
+  ├── Uses pi-subagents to parallelize research   ← via pi-subagents
+  └── Sends results to hendry                     ← via pi-network
+  │
+Hendry (VPS worker)
+  ├── Creates branch: agent/hendry/feature-x      ← auto
+  ├── Implements feature (may use pi-subagents)   ← via pi-subagents
+  ├── Auto-commits + pushes on task complete       ← auto
+  └── Sends result back to laptop                 ← via pi-network
+  │
+Laptop (manager)
+  ├── Receives result from hendry
+  ├── Periodic fetch detects new branch
+  ├── Reviews: /git-sync diff agent/hendry/feature-x
+  ├── Merges clean branches automatically
+  └── Consolidates conflicts in one pass
+```
+
+### Config
+
+```json
+// Manager (laptop)
+{
+  "role": "manager",
+  "git_sync": {
+    "mode": "github",
+    "base_branch": "main",
+    "fetch_interval_seconds": 30,
+    "auto_merge_clean": true,
+    "squash_merge": true
+  }
+}
+
+// Worker (venus, hendry, etc.)
+{
+  "role": "worker",
+  "git_sync": {
+    "mode": "github",
+    "branch_prefix": "agent/venus/",
+    "auto_commit_on_task_complete": true,
+    "auto_push_on_commit": true
+  }
+}
+```
+
+### Modes
+
+| Mode | Transport | Use when |
+|------|-----------|----------|
+| `github` | GitHub remote (default) | Both machines have GitHub access |
+| `direct` | SSH to remote machine | Same Tailscale/LAN, air-gapped |
+| `off` | None | Disable git sync |
+
+### Permissions
+
+| Action | Manager | Worker |
+|--------|---------|--------|
+| Merge to main | ✅ | ❌ (git hook blocks) |
+| Resolve conflicts | ✅ (consolidates) | ❌ |
+| Create branch | ✅ | ✅ (auto on task) |
+| Commit + push | ✅ | ✅ (auto on complete) |
+| Review branches | ✅ | ✅ (own only) |
+
+### Slash commands
+
+```
+/git-sync status              — Show git sync state
+/git-sync fetch               — Fetch all remotes
+/git-sync branches            — List agent branches
+/git-sync diff <branch>       — Show branch diff stat
+/git-sync full-diff <branch>  — Full diff for review
+/git-sync merge <branch>      — Merge branch into main
+/git-sync consolidate <branch> — Start conflict resolution
+/git-sync finalize <branch>   — Finalize after resolving conflicts
+/git-sync abort               — Abort in-progress merge
+```
+
+### Tool: `git_sync`
+
+The `git_sync` tool lets agents manage git programmatically:
+
+- **Workers**: `git_sync(action="branch")` creates a task branch, `git_sync(action="commit")` commits changes
+- **Manager**: `git_sync(action="fetch")`, `git_sync(action="branches")`, `git_sync(action="merge", branch="agent/hendry/feat-x")`, `git_sync(action="consolidate", branch="...")`
+
+### Conflict resolution
+
+When a branch conflicts with main:
+1. Manager calls `git_sync(action="merge", branch="...")` — detects conflicts
+2. Manager reads conflicting files, resolves in one pass
+3. Manager calls `git_sync(action="consolidate", branch="...")` — finalizes
+
+No back-and-forth with workers. Manager sees the full picture and consolidates.
+
+### Companion: `pi-subagents`
+
+Install [pi-subagents](https://github.com/nicobailon/pi-subagents) on each machine for local parallel workers:
+
+```bash
+pi install npm:pi-subagents
+```
+
+Workers use `pi-subagents` to parallelize within a machine (research subtopics, multi-file edits). `pi-network` coordinates across machines.
+
+---
+
 ## License
 
 MIT

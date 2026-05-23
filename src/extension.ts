@@ -57,6 +57,7 @@ import { WhatsAppBridge } from "./whatsapp-bridge";
 import { formatResultInline } from "./ui/inline-message";
 import type { PersonaDef } from "./core/personas";
 import { ulid } from "./core/ulid";
+import { GitSyncManager, loadGitSyncConfig } from "./core/git-sync";
 
 // ─── Body-size caps (prevent OOM from giant payloads) ───
 // Default cap for control endpoints (/task, /result, /clarification, etc.)
@@ -108,6 +109,7 @@ let idleQueue: IdleQueue;
 let presenceManager: PresenceManager;
 let replyTracker: ReplyTracker;
 let whatsappBridge: WhatsAppBridge | null = null;
+let gitSync: GitSyncManager | null = null;
 
 // Max age for an unresolved pendingTasks entry (1 hour).
 // task_await default timeout is 30 min, so 1 hour is a safe upper bound.
@@ -536,6 +538,20 @@ export default function extension(api: ExtensionAPI) {
       whatsappBridge = null;
     }
 
+    // ─── Git sync ───
+    const gitSyncCfg = loadGitSyncConfig(config);
+    if (gitSyncCfg.mode !== "off") {
+      try {
+        gitSync = new GitSyncManager(gitSyncCfg, config.role, config.localName, ctx.cwd);
+        gitSync.installBranchProtection();
+        gitSync.start();
+        ctx.ui.notify(`🔀 Git sync: ${gitSyncCfg.mode} | ${config.role} | base: ${gitSyncCfg.baseBranch}`, "info");
+      } catch (e: any) {
+        ctx.ui.notify(`⚠️ Git sync failed: ${e.message}`, "warning");
+        gitSync = null;
+      }
+    }
+
     updateAgentInRegistry(agents, {
       name: config.localName, role: config.role,
       capabilities: config.capabilities, specialties: config.specialties,
@@ -610,6 +626,7 @@ export default function extension(api: ExtensionAPI) {
     await transport?.stop();
     if (brokerClient) { await brokerClient.disconnect().catch(() => {}); brokerClient = null; }
     if (whatsappBridge) { await whatsappBridge.stop().catch(() => {}); whatsappBridge = null; }
+    if (gitSync) { gitSync.stop(); gitSync = null; }
     stopLocalBridge();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (pruneTimer) clearInterval(pruneTimer);
@@ -737,6 +754,16 @@ export default function extension(api: ExtensionAPI) {
       concurrency.complete(taskId);
       releaseAllForTask(envelope.rootTaskId, config);
       updateHistoryStatus(taskId, "completed", validatedResult.slice(0, 200));
+
+      // Git sync: worker auto-commits and pushes on task complete
+      if (gitSync && config.role === "worker") {
+        try {
+          const committed = gitSync.autoCommit(envelope.task, envelope.taskId);
+          if (committed) {
+            appendAudit({ event: "git_commit", taskId: envelope.taskId, sender: config.localName, reason: gitSync.getCurrentBranch() || "unknown" });
+          }
+        } catch {}
+      }
 
       await transport.sendResult(envelope.deliverTo, resultPayload).catch(() => {
         pushToOutbox(envelope.deliverTo, envelope);
@@ -1379,7 +1406,206 @@ export default function extension(api: ExtensionAPI) {
     },
   });
 
+  // git_sync — Git synchronization tool (worker: branch/commit/push, manager: fetch/merge/consolidate)
+  pi.registerTool({
+    name: "git_sync",
+    label: "Git Sync",
+    description: "Git sync operations. Workers: create branch, commit, push. Manager: fetch, list branches, merge, consolidate conflicts. Use this tool when you need to manage git branches for cross-agent code coordination.",
+    promptSnippet: "Sync git branch",
+    parameters: Type.Object({
+      action: StringEnum(["status", "branch", "commit", "push", "fetch", "branches", "diff", "merge", "consolidate", "abort"], { description: "Git sync action to perform" }),
+      task_description: Type.Optional(Type.String({ description: "Task description for branch name or commit message" })),
+      branch: Type.Optional(Type.String({ description: "Branch name for merge/diff/consolidate operations" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      if (!gitSync) {
+        return { content: [{ type: "text", text: "⬜ Git sync is not configured. Add git_sync to your config.json." }] };
+      }
+
+      switch (params.action) {
+        case "status": {
+          return { content: [{ type: "text", text: gitSync.getStatus() }] };
+        }
+        case "branch": {
+          if (config.role !== "worker") {
+            return { content: [{ type: "text", text: "❌ Only workers create task branches. Manager reviews and merges." }] };
+          }
+          const desc = params.task_description || "untitled";
+          const branchName = gitSync.createTaskBranch(desc);
+          return { content: [{ type: "text", text: `🌿 Created branch: ${branchName}\nYou can now edit files. They will be auto-committed when your task completes.` }] };
+        }
+        case "commit": {
+          const desc = params.task_description || "work in progress";
+          const taskId = params.branch || "manual";
+          const committed = gitSync.autoCommit(desc, taskId);
+          return { content: [{ type: "text", text: committed ? `✅ Changes committed and pushed to ${gitSync.getCurrentBranch()}` : "ℹ️ No changes to commit" }] };
+        }
+        case "push": {
+          gitSync.pushCurrentBranch();
+          return { content: [{ type: "text", text: `📤 Pushed ${gitSync.getCurrentBranch()}` }] };
+        }
+        case "fetch": {
+          gitSync.fetch();
+          return { content: [{ type: "text", text: "📥 Fetched all remotes" }] };
+        }
+        case "branches": {
+          const branches = gitSync.listAgentBranches();
+          if (branches.length === 0) {
+            return { content: [{ type: "text", text: "No agent branches found" }] };
+          }
+          const lines = branches.map(b => {
+            const icon = b.isClean ? "🟢" : "🔴";
+            return `${icon} ${b.name} (${b.lastCommitAuthor}, ${b.aheadBy} ahead) — ${b.lastCommitMessage}`;
+          });
+          return { content: [{ type: "text", text: `🌿 Agent Branches:\n${lines.join("\n")}` }] };
+        }
+        case "diff": {
+          const branchName = params.branch;
+          if (!branchName) return { content: [{ type: "text", text: "❌ Specify branch name" }] };
+          const diff = gitSync.getBranchDiff(branchName);
+          return { content: [{ type: "text", text: `📊 Diff for ${branchName}:\n${diff}` }] };
+        }
+        case "merge": {
+          const branchName = params.branch;
+          if (!branchName) return { content: [{ type: "text", text: "❌ Specify branch name" }] };
+          const result = gitSync.mergeBranch(branchName);
+          if (result.merged) {
+            return { content: [{ type: "text", text: `✅ Merged ${branchName} into ${gitSync.getStatus().split("base: ")[1]?.split(" ")[0] || "main"}` }] };
+          } else if (result.hadConflicts) {
+            return { content: [{ type: "text", text: `🔴 Conflicts in ${branchName}:\n\n${result.conflictedFiles.map(f => `  - ${f}`).join("\n")}\n\nResolve the conflicts in these files, then use git_sync action=consolidate branch=${branchName}` }] };
+          } else {
+            return { content: [{ type: "text", text: `❌ ${result.message}` }] };
+          }
+        }
+        case "consolidate": {
+          const branchName = params.branch;
+          if (!branchName) return { content: [{ type: "text", text: "❌ Specify branch name" }] };
+          const conflicts = gitSync.getConflictedFiles();
+          if (conflicts.length > 0) {
+            return { content: [{ type: "text", text: `⚠️ Still have conflict markers in:\n${conflicts.map(f => `  - ${f}`).join("\n")}\n\nRead each file, resolve the conflict markers (<<<<<<<, =======, >>>>>>>), then call consolidate again.` }] };
+          }
+          const resolved = new Map<string, string>();
+          const mergeResult = gitSync.consolidateBranch(branchName, resolved);
+          return { content: [{ type: "text", text: mergeResult.merged ? `✅ ${mergeResult.message}` : `❌ ${mergeResult.message}` }] };
+        }
+        case "abort": {
+          gitSync.abortMerge();
+          return { content: [{ type: "text", text: "🛑 Merge aborted" }] };
+        }
+        default:
+          return { content: [{ type: "text", text: `Unknown action: ${params.action}` }] };
+      }
+    },
+  });
+
   // ─── Slash commands ───
+  pi.registerCommand({
+    name: "git-sync",
+    description: "Git sync operations: status, fetch, branches, merge <branch>, diff <branch>, consolidate <branch>. Manager-only: merge, consolidate.",
+    async execute(args, ctx) {
+      const parts = (args || "").trim().split(/\s+/);
+      const subcommand = parts[0] || "status";
+      const target = parts[1];
+
+      if (!gitSync) {
+        ctx.ui.notify("⬜ Git sync is not configured. Add git_sync to your config.json.", "info");
+        return;
+      }
+
+      switch (subcommand) {
+        case "status": {
+          ctx.ui.notify(`🔀 Git Sync\n${gitSync.getStatus()}`, "info");
+          break;
+        }
+        case "fetch": {
+          gitSync.fetch();
+          ctx.ui.notify("📥 Fetched all remotes", "info");
+          break;
+        }
+        case "branches": {
+          const branches = gitSync.listAgentBranches();
+          if (branches.length === 0) {
+            ctx.ui.notify("No agent branches found", "info");
+          } else {
+            const lines = branches.map(b => {
+              const icon = b.isClean ? "🟢" : "🔴";
+              const ahead = b.aheadBy > 0 ? ` +${b.aheadBy}` : "";
+              const behind = b.behindBy > 0 ? ` -${b.behindBy}` : "";
+              return `  ${icon} ${b.name} (${b.lastCommitAuthor}, ${b.lastCommitDate})${ahead}${behind}\n     ${b.lastCommitMessage}`;
+            });
+            ctx.ui.notify(`🌿 Agent Branches\n${lines.join("\n")}`, "info");
+          }
+          break;
+        }
+        case "diff": {
+          if (!target) {
+            ctx.ui.notify("Usage: /git-sync diff <branch-name>", "info");
+            break;
+          }
+          const diff = gitSync.getBranchDiff(target);
+          ctx.ui.notify(`📊 Diff: ${target}\n${diff}`, "info");
+          break;
+        }
+        case "full-diff": {
+          if (!target) {
+            ctx.ui.notify("Usage: /git-sync full-diff <branch-name>", "info");
+            break;
+          }
+          const fullDiff = gitSync.getBranchFullDiff(target);
+          ctx.ui.notify(`📊 Full Diff: ${target}\n${fullDiff.slice(0, 5000)}`, "info");
+          break;
+        }
+        case "merge": {
+          if (!target) {
+            ctx.ui.notify("Usage: /git-sync merge <branch-name>", "info");
+            break;
+          }
+          const result = gitSync.mergeBranch(target);
+          if (result.merged) {
+            ctx.ui.notify(`✅ Merged ${target} into main`, "info");
+          } else if (result.hadConflicts) {
+            ctx.ui.notify(`🔴 Conflicts in ${target}:\n${result.conflictedFiles.join("\n")}\n\nResolve conflicts then: /git-sync consolidate ${target}`, "info");
+          } else {
+            ctx.ui.notify(`❌ Merge failed: ${result.message}`, "info");
+          }
+          break;
+        }
+        case "consolidate": {
+          if (!target) {
+            ctx.ui.notify("Usage: /git-sync consolidate <branch-name>", "info");
+            break;
+          }
+          ctx.ui.notify(`📋 To consolidate ${target}:\n1. Resolve conflict markers in the files\n2. /git-sync finalize ${target}`, "info");
+          break;
+        }
+        case "finalize": {
+          if (!target) {
+            ctx.ui.notify("Usage: /git-sync finalize <branch-name>", "info");
+            break;
+          }
+          // Read all conflicted files and pass them as resolved
+          const conflicts = gitSync.getConflictedFiles();
+          if (conflicts.length === 0) {
+            // No active conflicts — just stage and commit
+            const resolved = new Map<string, string>();
+            const mergeResult = gitSync.consolidateBranch(target, resolved);
+            ctx.ui.notify(mergeResult.merged ? `✅ ${mergeResult.message}` : `❌ ${mergeResult.message}`, "info");
+          } else {
+            ctx.ui.notify(`⚠️ Still conflicts in: ${conflicts.join(", ")}\nResolve them first, then /git-sync finalize ${target}`, "info");
+          }
+          break;
+        }
+        case "abort": {
+          gitSync.abortMerge();
+          ctx.ui.notify("🛑 Merge aborted", "info");
+          break;
+        }
+        default:
+          ctx.ui.notify(`Unknown subcommand: ${subcommand}\nUsage: /git-sync [status|fetch|branches|diff|merge|consolidate|finalize|abort]`, "info");
+      }
+    },
+  });
+
   pi.registerCommand({
     name: "network",
     description: "Show network status, manage peers. Flags: --all (show all projects), --project=NAME (filter), --prune (force prune)",
@@ -1423,6 +1649,7 @@ export default function extension(api: ExtensionAPI) {
       lines.push(`  Max hops: ${config.maxHops} | Damage control: ${config.damageControl ? "on" : "off"}`);
       lines.push(`  Broker: ${brokerClient?.isConnected() ? "🟢 connected" : "🔴 disconnected"} | Idle queue: ${idleQueue.length}`);
       lines.push(`  WhatsApp: ${whatsappBridge ? "🟢 active" : "⬜ off"} | Presence: ${presenceManager.formatState()}`);
+      if (gitSync) lines.push(`  Git: ${gitSync.getStatus()}`);
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
