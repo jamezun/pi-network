@@ -62,6 +62,7 @@ import { NetworkComposeOverlay } from "./ui/compose";
 import type { PersonaDef } from "./core/personas";
 import { ulid } from "./core/ulid";
 import { GitSyncManager, loadGitSyncConfig } from "./core/git-sync";
+import { validateInterviewRequest, formatInterviewRequest, parseInterviewReply, type InterviewRequest, type InterviewReply } from "./core/interview";
 
 // ─── Body-size caps (prevent OOM from giant payloads) ───
 // Default cap for control endpoints (/task, /result, /clarification, etc.)
@@ -125,8 +126,30 @@ let currentSessionId: string | null = null;
 let currentModel = "unknown";
 let sessionStartedAt: number | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let startupConnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempt = 0;
+let reconnectPromise: Promise<BrokerClient> | null = null;
+let reconnectPromiseGeneration: number | null = null;
 const RECONNECT_DELAYS = [1000, 2000, 5000, 10_000, 30_000];
+
+// Duplicate session name detection
+function duplicateSessionNames(sessions: { name?: string }[]): Set<string> {
+  return new Set(
+    sessions.map(s => s.name?.toLowerCase()).filter((n): n is string => Boolean(n))
+      .filter((n, i, a) => a.indexOf(n) !== i)
+  );
+}
+function shortSessionId(id: string): string { return id.slice(0, 8); }
+function formatSessionLabel(session: { name?: string; id: string }, dupes: Set<string>): string {
+  if (!session.name) return session.id;
+  return dupes.has(session.name.toLowerCase()) ? `${session.name} (${shortSessionId(session.id)})` : session.name;
+}
+
+function previewText(value: unknown, maxLen = 72): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const n = value.replace(/\s+/g, " ").trim();
+  return n && (n.length > maxLen ? n.slice(0, maxLen - 1) + "…" : n) || undefined;
+}
 
 function getLiveContext(ctx: ExtensionContext | null = runtimeContext, generation = runtimeGeneration): ExtensionContext | null {
   if (disposed || shuttingDown || generation !== runtimeGeneration || !ctx) return null;
@@ -145,6 +168,9 @@ function notifyIfLive(ctx: ExtensionContext, message: string, level: "info" | "w
 
 function clearReconnectTimer(): void {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+}
+function clearStartupConnectTimer(): void {
+  if (startupConnectTimer) { clearTimeout(startupConnectTimer); startupConnectTimer = null; }
 }
 
 function getReconnectDelayMs(): number {
@@ -167,30 +193,40 @@ async function ensureBrokerConnected(reason: "startup" | "background" | "tool" |
   if (disposed || shuttingDown) throw new Error("Network shutting down");
   if (brokerClient?.isConnected()) return brokerClient;
   const ctx = getLiveContext();
+  const gen = runtimeGeneration;
   if (!ctx || !currentSessionId) throw new Error("Network runtime not initialized");
   clearReconnectTimer();
 
-  const nextClient = new BrokerClient();
-  brokerClient = nextClient;
-  attachBrokerClientHandlers(nextClient);
+  // Deduplicate concurrent reconnect attempts
+  if (reconnectPromise && reconnectPromiseGeneration === gen) return reconnectPromise;
 
-  try {
-    await spawnBrokerIfNeeded();
-    await nextClient.connect({
-      name: config.localName, cwd: ctx.cwd, model: currentModel, pid: process.pid,
-      startedAt: sessionStartedAt!, lastActivity: Date.now(),
-      status: presenceManager.formatState(), role: config.role,
-      capabilities: config.capabilities, specialties: config.specialties,
-      color: config.color, purpose: config.purpose, project: config.project,
-    });
-    if (!getLiveContext()) { await nextClient.disconnect(); throw new Error("Runtime no longer active"); }
-    reconnectAttempt = 0;
-    return nextClient;
-  } catch (e) {
-    if (brokerClient === nextClient) brokerClient = null;
-    if (reason === "background") scheduleReconnect();
-    throw e;
-  }
+  const nextPromise = (async (): Promise<BrokerClient> => {
+    const nextClient = new BrokerClient();
+    brokerClient = nextClient;
+    attachBrokerClientHandlers(nextClient);
+    try {
+      await spawnBrokerIfNeeded();
+      await nextClient.connect({
+        name: config.localName, cwd: ctx.cwd, model: currentModel, pid: process.pid,
+        startedAt: sessionStartedAt!, lastActivity: Date.now(),
+        status: presenceManager.formatState(), role: config.role,
+        capabilities: config.capabilities, specialties: config.specialties,
+        color: config.color, purpose: config.purpose, project: config.project,
+      });
+      if (!getLiveContext(ctx, gen)) { await nextClient.disconnect(); throw new Error("Runtime no longer active"); }
+      reconnectAttempt = 0;
+      return nextClient;
+    } catch (e) {
+      if (brokerClient === nextClient) brokerClient = null;
+      if (reason === "background") scheduleReconnect();
+      throw e;
+    } finally {
+      if (reconnectPromise === nextPromise) { reconnectPromise = null; reconnectPromiseGeneration = null; }
+    }
+  })();
+  reconnectPromise = nextPromise;
+  reconnectPromiseGeneration = gen;
+  return nextPromise;
 }
 
 function attachBrokerClientHandlers(client: BrokerClient): void {
@@ -201,6 +237,8 @@ function attachBrokerClientHandlers(client: BrokerClient): void {
   });
   client.on("disconnected", () => {
     if (brokerClient !== client) return;
+    // Reject any pending reply waiter
+    if (replyWaiter) replyWaiter.reject(new Error("Broker disconnected"));
     brokerClient = null;
     if (!shuttingDown && !disposed) {
       clearReconnectTimer();
@@ -212,7 +250,8 @@ function attachBrokerClientHandlers(client: BrokerClient): void {
   client.on("session_joined", (session) => {
     const ctx = getLiveContext();
     if (!ctx) return;
-    notifyIfLive(ctx, `🟢 ${session.name || session.id} joined the mesh`, "info");
+    const label = session.name || shortSessionId(session.id);
+    notifyIfLive(ctx, `🟢 ${label} joined the mesh`, "info");
     agents = loadRegistry();
   });
   client.on("session_left", (sessionId) => {
@@ -221,6 +260,16 @@ function attachBrokerClientHandlers(client: BrokerClient): void {
   client.on("presence_update", (session) => {
     agents = loadRegistry();
   });
+}
+
+// Check if target matches current session (local self-delivery)
+function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: BrokerClient | null): boolean {
+  const targets = new Set<string>();
+  const add = (t: string | null | undefined) => { const v = t?.trim(); if (v) targets.add(v.toLowerCase()); };
+  add(currentSessionId);
+  add(activeClient?.sessionId);
+  add(config.localName);
+  return Boolean(resolvedTo && activeClient?.sessionId && resolvedTo === activeClient.sessionId) || targets.has(to.trim().toLowerCase());
 }
 
 // Stub — implemented later in the file, referenced by ensureBrokerConnected
@@ -521,6 +570,7 @@ export default function extension(api: ExtensionAPI) {
     runtimeGeneration++;
     reconnectAttempt = 0;
     clearReconnectTimer();
+    clearStartupConnectTimer();
     runtimeContext = ctx;
     currentSessionId = ctx.sessionManager.getSessionId();
     currentModel = ctx.model?.id ?? "unknown";
@@ -604,15 +654,20 @@ export default function extension(api: ExtensionAPI) {
     startPruneLoop();
     startPendingTasksCleanup();
 
-    // ─── Phase 1.1: Auto-discovery broker ───
-    try {
-      await ensureBrokerConnected("startup");
-      notifyIfLive(ctx, "🔗 Connected to auto-discovery broker", "info");
-    } catch (e: any) {
-      notifyIfLive(ctx, `⚠️ Broker unavailable: ${e.message} (continuing without auto-discovery)`, "warning");
-      brokerClient = null;
-      scheduleReconnect();
-    }
+    // ─── Phase 1.1: Auto-discovery broker (deferred to next tick) ───
+    const startupGen = runtimeGeneration;
+    startupConnectTimer = setTimeout(() => {
+      startupConnectTimer = null;
+      if (!getLiveContext(ctx, startupGen)) return;
+      ensureBrokerConnected("startup")
+        .then(() => notifyIfLive(ctx, "🔗 Connected to auto-discovery broker", "info", startupGen))
+        .catch((e: any) => {
+          if (!getLiveContext(ctx, startupGen)) return;
+          notifyIfLive(ctx, `⚠️ Broker unavailable: ${e.message} (continuing without auto-discovery)`, "warning", startupGen);
+          brokerClient = null;
+          scheduleReconnect();
+        });
+    }, 0);
 
     // ─── Phase 2.4: WhatsApp bridge ───
     try {
@@ -716,6 +771,9 @@ export default function extension(api: ExtensionAPI) {
     disposed = true;
     runtimeGeneration++;
     clearReconnectTimer();
+    clearStartupConnectTimer();
+    // Reject any pending reply waiter
+    if (replyWaiter) { replyWaiter.reject(new Error("Session shutting down")); replyWaiter = null; }
     replyTracker.reset();
     await transport?.stop();
     if (brokerClient) { await brokerClient.disconnect().catch(() => {}); brokerClient = null; }
@@ -898,19 +956,58 @@ export default function extension(api: ExtensionAPI) {
 
   // ─── Broker inbound message handler (implementation for forward reference) ───
   handleBrokerInboundMessage = (ctx: ExtensionContext, from: any, message: any) => {
-    if (!getLiveContext(ctx)) return;
+    const msgGen = runtimeGeneration;
+    const live = getLiveContext(ctx, msgGen);
+    if (!live) return;
+
     const turnCtx = replyTracker.recordIncomingMessage(from, message);
     replyTracker.queueTurnContext(turnCtx);
+
+    // Check if agent is idle — queue if busy
+    void (async () => {
+      const activeCtx = getLiveContext(ctx, msgGen);
+      if (!activeCtx) return;
+
+      let isIdle: boolean;
+      try { isIdle = (activeCtx as any).isIdle?.() ?? true; } catch { return; }
+
+      if (!isIdle) {
+        // Auto-reply to sender if non-interactive (headless) and this isn't a reply
+        if (!activeCtx.hasUI && !message.replyTo && brokerClient?.isConnected()) {
+          try {
+            const r = await brokerClient.send(from.id, {
+              text: "Agent is busy and non-interactive. Will continue current task and respond when idle.",
+              replyTo: message.id,
+            });
+            if (r.delivered && getLiveContext(ctx, msgGen)) replyTracker.markReplied(message.id);
+          } catch { /* best-effort */ }
+          return;
+        }
+        // Interactive but busy — queue for later
+        idleQueue.enqueue({ ...message, _from: from });
+        return;
+      }
+
+      deliverInboundMessage(from, message);
+    })();
+  };
+
+  function deliverInboundMessage(from: any, message: any): void {
     const inboundFrom = from.name || from.id;
+    const attachmentText = message.content?.attachments?.length
+      ? message.content.attachments.map((a: any) => `\n---\n📎 ${a.name}${a.language ? ` (${a.language})` : ""}\n${a.content}`).join("")
+      : "";
+    const bodyText = `${message.content.text}${attachmentText}`;
+    const replyCmd = message.expectsReply ? `network_comm({ action: "reply", message: "..." })` : undefined;
     pi.sendMessage({
       customType: "network-inbound",
-      content: message.content.text,
+      content: bodyText,
       display: true,
-      details: makeMessageDetails("inbound_task", inboundFrom, message.content.text, {
-        replyCommand: message.expectsReply ? "network_comm({ action: \"reply\", message: \"...\" })" : undefined,
-      }),
+      details: makeMessageDetails("inbound_task", inboundFrom, bodyText, { replyCommand: replyCmd }),
     }, { triggerTurn: message.expectsReply ?? false });
-  };
+    // Audit trail
+    pi.appendEntry?.("network_received", { from: inboundFrom, messageId: message.id, timestamp: Date.now() });
+  }
 
   // ─── Tools ───
 
@@ -918,9 +1015,9 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "task_send",
     label: "Task Send",
-    description: "Send a task to a remote agent. Returns a msg_id once the receiver acks. Use task_get (non-blocking) or task_await (blocking) with the msg_id to retrieve the response.",
-    promptSnippet: "Send task to remote agent",
-    promptGuidelines: ["Match task to agent specialties", "Use peer name from config"],
+    description: "Send task to remote agent. Returns msg_id. Poll with task_get or block with task_await.",
+    promptSnippet: "Send task",
+    promptGuidelines: ["match task to agent specialty", "use peer name from config"],
     parameters: Type.Object({
       peer: Type.String({ description: "Peer name from config or discovered agents" }),
       task: Type.String({ description: "Task to execute" }),
@@ -1008,7 +1105,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "task_get",
     label: "Task Get",
-    description: "Non-blocking poll on a taskId. Returns pending/complete/error.",
+    description: "Non-blocking poll on taskId.",
     parameters: Type.Object({
       taskId: Type.String({ description: "taskId returned by task_send" }),
     }),
@@ -1045,7 +1142,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "task_await",
     label: "Task Await",
-    description: "Block until the reply lands or a timeout fires (default 30 min).",
+    description: "Block until reply or timeout (default 30min).",
     parameters: Type.Object({
       taskId: Type.String({ description: "taskId returned by task_send" }),
       timeout_ms: Type.Optional(Type.Number({ description: "Timeout in milliseconds (default 1800000 = 30 min)" })),
@@ -1084,9 +1181,9 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "remote_task",
     label: "Remote Task",
-    description: "Send a task to a remote agent and wait for the result. Combines task_send + task_await for convenience.",
-    promptSnippet: "Delegate work to remote agent",
-    promptGuidelines: ["Match task to agent specialties", "Use peer name from config"],
+    description: "Send task + await result (task_send + task_await combined).",
+    promptSnippet: "Remote task",
+    promptGuidelines: ["match task to agent specialty", "use peer name from config"],
     parameters: Type.Object({
       peer: Type.String({ description: "Peer name from config" }),
       task: Type.String({ description: "Task to execute" }),
@@ -1181,7 +1278,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "send_file",
     label: "Send File",
-    description: "Send a file to a remote agent. Token-free transfer.",
+    description: "Send file to remote agent (base64, token-free).",
     parameters: Type.Object({
       peer: Type.String({ description: "Peer name" }),
       path: Type.String({ description: "Local file path" }),
@@ -1200,7 +1297,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "broadcast_task",
     label: "Broadcast Task",
-    description: "Send a task to all online agents or filtered by capability. Uses Promise.allSettled for parallel fan-out.",
+    description: "Fan-out task to all online agents or filtered by capability.",
     parameters: Type.Object({
       task: Type.String({ description: "The task" }),
       filter: Type.Optional(Type.String({ description: "Filter: 'all', 'online', or a capability name" })),
@@ -1251,7 +1348,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "peer_status",
     label: "Peer Status",
-    description: "Get detailed status of all peers or a specific peer. Includes context usage and stale counter.",
+    description: "Peer status (context usage, stale counter, queue depth).",
     parameters: Type.Object({
       peer: Type.Optional(Type.String({ description: "Specific peer name (omit for all)" })),
       project: Type.Optional(Type.String({ description: "Filter by project namespace (default: current project, '*' for all)" })),
@@ -1295,7 +1392,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "ask_origin",
     label: "Ask Origin",
-    description: "Ask a clarification question that routes through the chain back to the origin.",
+    description: "Clarification question routed back to origin.",
     parameters: Type.Object({
       taskId: Type.String({ description: "Task ID to clarify" }),
       question: Type.String({ description: "Your question" }),
@@ -1320,7 +1417,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "return_task",
     label: "Return Task",
-    description: "Return a task you can't handle. Manager will reassign or handle it.",
+    description: "Return unhandleable task. Manager reassigns.",
     parameters: Type.Object({
       taskId: Type.String({ description: "Task ID to return" }),
       reason: Type.String({ description: "Why you can't handle it" }),
@@ -1354,7 +1451,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "kill_task",
     label: "Kill Task",
-    description: "Kill a queued or running task on any agent in the network.",
+    description: "Kill a queued or running task.",
     parameters: Type.Object({
       taskId: Type.String({ description: "Task ID to kill" }),
       peer: Type.Optional(Type.String({ description: "Peer where task is running (omit for local)" })),
@@ -1376,7 +1473,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "task_history",
     label: "Task History",
-    description: "View task history with optional filters.",
+    description: "View task history.",
     parameters: Type.Object({
       peer: Type.Optional(Type.String({ description: "Filter by peer" })),
       status: Type.Optional(StringEnum(["queued", "running", "completed", "failed", "reassigned", "killed"] as const)),
@@ -1401,7 +1498,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "list_locks",
     label: "List Locks",
-    description: "Show all active file locks or locks for a specific file.",
+    description: "List active file locks.",
     parameters: Type.Object({
       file: Type.Optional(Type.String({ description: "Filter by file path" })),
     }),
@@ -1433,7 +1530,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "send_vault",
     label: "Send Vault Secret",
-    description: "Send an encrypted secret to a remote agent. Auto-deletes after task.",
+    description: "Send encrypted secret to remote agent (auto-deletes after task).",
     parameters: Type.Object({
       peer: Type.String({ description: "Peer name" }),
       key: Type.String({ description: "Secret key name" }),
@@ -1459,7 +1556,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "sync_project",
     label: "Sync Project",
-    description: "Sync project files with a remote agent using git over Tailscale.",
+    description: "Sync project files with remote agent via git.",
     parameters: Type.Object({
       peer: Type.String({ description: "Peer name to sync with" }),
       direction: StringEnum(["push", "pull"] as const, { description: "push = send to peer, pull = get from peer" }),
@@ -1496,7 +1593,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "request_file_lock",
     label: "Request File Lock",
-    description: "Wait for a file lock to be released, then acquire it.",
+    description: "Wait for file lock release then acquire.",
     parameters: Type.Object({
       path: Type.String({ description: "File path" }),
       startLine: Type.Number({ description: "Start line" }),
@@ -1529,7 +1626,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "audit_log",
     label: "Audit Log",
-    description: "View privacy-respecting audit log (msg_id + sender + hops, never prompt bodies).",
+    description: "View audit log (msg_id + sender + hops, no prompt bodies).",
     parameters: Type.Object({
       event: Type.Optional(Type.String({ description: "Filter by event type" })),
       limit: Type.Optional(Type.Number({ description: "Max entries (default 20)" })),
@@ -1576,14 +1673,9 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "network_comm",
     label: "Network Communication",
-    description: "Direct messaging across the mesh. Actions: 'send' (fire-and-forget), 'ask' (send + wait for reply), 'reply' (auto-target current sender), 'pending' (show unresolved asks), 'status' (connection info). Use 'ask' when you need a response to continue, 'send' for fire-and-forget notifications, 'reply' when responding to an incoming message.",
-    promptSnippet: "Send message across mesh",
-    promptGuidelines: [
-      "Use network_comm action='ask' when you need a response to continue working.",
-      "Use network_comm action='send' for fire-and-forget notifications.",
-      "Use network_comm action='reply' when responding to an inbound message — it auto-targets the sender.",
-      "Use network_comm action='pending' to check for unresolved asks.",
-    ],
+    description: "Mesh messaging. send=fire&forget, ask=send+await reply, reply=auto-target sender, pending=list unresolved asks, status=connection info.",
+    promptSnippet: "Mesh message",
+    promptGuidelines: ["ask when need response", "send for notifications", "reply auto-targets sender", "pending shows unanswered asks"],
     parameters: Type.Object({
       action: StringEnum(["send", "ask", "reply", "pending", "status"], { description: "Communication action" }),
       to: Type.Optional(Type.String({ description: "Target agent name (for send/ask, or to disambiguate reply)" })),
@@ -1629,6 +1721,7 @@ export default function extension(api: ExtensionAPI) {
           try {
             const result = await client.send(to, { text: message, attachments });
             appendAudit({ event: "comm_send", sender: config.localName, recipient: to, hops: 0 });
+            pi.appendEntry?.("network_sent", { to, messageId: result.id, message: message.slice(0, 200), timestamp: Date.now() });
             return {
               content: [{ type: "text", text: result.delivered ? `✅ Delivered to ${to}` : `❌ Not delivered: ${result.reason}` }],
               isError: !result.delivered,
@@ -1655,6 +1748,7 @@ export default function extension(api: ExtensionAPI) {
               return { content: [{ type: "text", text: `❌ Not delivered: ${sendResult.reason}` }], isError: true };
             }
             appendAudit({ event: "comm_ask", sender: config.localName, recipient: to, hops: 0 });
+            pi.appendEntry?.("network_sent", { to, messageId: questionId, message: message.slice(0, 200), timestamp: Date.now() });
             // Block until reply
             const reply = await waitForReply(to, questionId, signal);
             replyTracker.markReplied(questionId);
@@ -1686,6 +1780,7 @@ export default function extension(api: ExtensionAPI) {
             const result = await client.send(target.to, { text: message, replyTo: target.replyTo, attachments });
             replyTracker.markReplied(target.replyTo);
             appendAudit({ event: "comm_reply", sender: config.localName, recipient: target.to, hops: 0 });
+            pi.appendEntry?.("network_sent", { to: target.to, replyTo: target.replyTo, message: message.slice(0, 200), timestamp: Date.now() });
             return {
               content: [{ type: "text", text: result.delivered ? `✅ Reply sent to ${target.to}` : `❌ Not delivered: ${result.reason}` }],
               isError: !result.delivered,
@@ -1717,41 +1812,161 @@ export default function extension(api: ExtensionAPI) {
     },
   });
 
-  // ─── contact_supervisor — Subagent-to-supervisor escalation (requires pi-subagents env vars) ───
+  // ─── Tier 2: Event-based pi-subagents relay + local self-delivery + delivery ACKs ───
+  const SUBAGENT_CONTROL_EVENT = "subagent:control-intercom";
+  const SUBAGENT_RESULT_EVENT = "subagent:result-intercom";
+  const SUBAGENT_RESULT_DELIVERY_EVENT = "subagent:result-intercom-delivery";
+
+  function parseSubagentPayload(payload: unknown): { to: string; message: string; requestId?: string } | null {
+    if (typeof payload !== "object" || payload === null) return null;
+    const r = payload as Record<string, unknown>;
+    if (typeof r.to !== "string" || typeof r.message !== "string") return null;
+    return { to: r.to, message: r.message, requestId: typeof r.requestId === "string" ? r.requestId : undefined };
+  }
+
+  function emitResultDelivery(requestId: string | undefined, delivered: boolean, error?: unknown): void {
+    if (!requestId) return;
+    pi.events?.emit(SUBAGENT_RESULT_DELIVERY_EVENT, {
+      requestId, delivered, ...(error ? { error: error instanceof Error ? error.message : String(error) } : {}),
+    });
+  }
+
+  function deliverLocalSubagentRelayMessage(sender: string, status: string, messageText: string): void {
+    deliverInboundMessage({ id: sender, name: sender, cwd: runtimeContext?.cwd ?? process.cwd(), model: sender, pid: process.pid, startedAt: Date.now(), lastActivity: Date.now(), status }, { id: randomUUID(), timestamp: Date.now(), content: { text: messageText } });
+  }
+
+  function relaySubagentPayload(payload: unknown, options: { sender: string; status: string; errorEntryType: string; acknowledge?: boolean }): void {
+    const parsed = parseSubagentPayload(payload);
+    if (!parsed) return;
+    const relayGen = runtimeGeneration;
+    void (async () => {
+      const stillLive = () => !runtimeStarted || Boolean(getLiveContext(runtimeContext, relayGen));
+      if (!stillLive()) return;
+
+      // Local self-delivery
+      if (currentSessionTargetMatches(parsed.to)) {
+        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
+        if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
+        return;
+      }
+
+      let activeClient: BrokerClient;
+      try { activeClient = await ensureBrokerConnected("background"); } catch (e: any) {
+        if (!stillLive()) return;
+        pi.appendEntry?.(options.errorEntryType, { to: parsed.to, message: parsed.message, error: e.message, timestamp: Date.now() });
+        if (options.acknowledge) emitResultDelivery(parsed.requestId, false, e);
+        return;
+      }
+
+      // Double-check after async connect
+      if (currentSessionTargetMatches(parsed.to, activeClient.sessionId, activeClient)) {
+        deliverLocalSubagentRelayMessage(options.sender, options.status, parsed.message);
+        if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
+        return;
+      }
+
+      try {
+        const result = await activeClient.send(parsed.to, { text: parsed.message });
+        if (!stillLive()) return;
+        if (!result.delivered) {
+          const err = new Error(result.reason ?? "Session not found");
+          pi.appendEntry?.(options.errorEntryType, { to: parsed.to, message: parsed.message, error: err.message, timestamp: Date.now() });
+          if (options.acknowledge) emitResultDelivery(parsed.requestId, false, err);
+          return;
+        }
+        pi.appendEntry?.("network_sent", { to: parsed.to, messageId: result.id, timestamp: Date.now() });
+        if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
+      } catch (e: any) {
+        if (!stillLive()) return;
+        pi.appendEntry?.(options.errorEntryType, { to: parsed.to, message: parsed.message, error: e.message, timestamp: Date.now() });
+        if (options.acknowledge) emitResultDelivery(parsed.requestId, false, e);
+      }
+    })();
+  }
+
+  pi.events?.on?.(SUBAGENT_CONTROL_EVENT, (payload: unknown) => {
+    relaySubagentPayload(payload, { sender: "subagent-control", status: "needs_attention", errorEntryType: "network_control_error" });
+  });
+  pi.events?.on?.(SUBAGENT_RESULT_EVENT, (payload: unknown) => {
+    relaySubagentPayload(payload, { sender: "subagent-result", status: "result", errorEntryType: "network_result_error", acknowledge: true });
+  });
+
+  // ─── contact_supervisor — Full subagent-supervisor bridge (interview + decision + progress) ───
   const orchestratorTarget = process.env.PI_SUBAGENT_ORCHESTRATOR_TARGET?.trim();
   const subRunId = process.env.PI_SUBAGENT_RUN_ID?.trim();
   const subAgent = process.env.PI_SUBAGENT_CHILD_AGENT?.trim();
   const subIndex = process.env.PI_SUBAGENT_CHILD_INDEX?.trim();
 
   if (orchestratorTarget && subRunId && subAgent && subIndex) {
+    function formatSubagentMessage(kind: "ask" | "update" | "interview", msg: string): string {
+      const heading = kind === "ask" ? "Subagent needs a supervisor decision."
+        : kind === "interview" ? "Subagent requests a structured interview."
+        : "Subagent progress update.";
+      return [heading, `Run: ${subRunId}`, `Agent: ${subAgent}`, `Child: ${subIndex}`, "", msg].join("\n");
+    }
+
     pi.registerTool({
       name: "contact_supervisor",
       label: "Contact Supervisor",
-      description: "Subagent-only: contact the supervisor that delegated this task. Use 'need_decision' when blocked or uncertain (blocks until reply). Use 'progress_update' for meaningful plan-changing updates (fire-and-forget). Do not use for routine completion.",
+      description: "Subagent-only: contact the supervisor. Use 'need_decision' when blocked (blocks until reply). Use 'interview_request' for structured Q&A (blocks until reply). Use 'progress_update' for plan-changing updates (fire-and-forget). Do not use for routine completion.",
       promptSnippet: "Contact supervisor",
+      promptGuidelines: [
+        "Use reason='need_decision' when blocked, uncertain, or needing approval.",
+        "Use reason='interview_request' when you need multiple structured answers.",
+        "Use reason='progress_update' only for meaningful plan-changing updates.",
+        "Do not use for routine completion handoffs.",
+      ],
       parameters: Type.Object({
-        reason: StringEnum(["need_decision", "progress_update"], { description: "Contact reason" }),
-        message: Type.String({ description: "Decision request or progress update" }),
+        reason: StringEnum(["need_decision", "progress_update", "interview_request"], { description: "Contact reason" }),
+        message: Type.Optional(Type.String({ description: "Decision request, interview note, or progress update" })),
+        interview: Type.Optional(Type.Object({
+          title: Type.Optional(Type.String()),
+          description: Type.Optional(Type.String()),
+          questions: Type.Array(Type.Object({
+            id: Type.String(),
+            type: Type.String({ description: "single|multi|text|image|info" }),
+            question: Type.String(),
+            options: Type.Optional(Type.Array(Type.Any())),
+            context: Type.Optional(Type.String()),
+          })),
+        }, { description: "Structured interview for reason='interview_request'" })),
       }),
       async execute(_id, params, signal, _onUpdate, ctx) {
-        const { reason, message } = params;
+        const { reason, message, interview } = params;
+
+        // Validate interview if provided
+        const interviewResult = reason === "interview_request" ? validateInterviewRequest(interview) : undefined;
+        if (interviewResult?.ok === false) return { content: [{ type: "text", text: `Invalid interview: ${interviewResult.error}` }], isError: true };
+        const validInterview = interviewResult?.ok === true ? interviewResult.interview : undefined;
+
+        if ((reason === "need_decision" || reason === "progress_update") && typeof message !== "string") {
+          return { content: [{ type: "text", text: `Missing 'message' for reason='${reason}'` }], isError: true };
+        }
+
+        // Local self-delivery
+        if (currentSessionTargetMatches(orchestratorTarget)) {
+          const localMsg = reason === "interview_request"
+            ? formatSubagentMessage("interview", formatInterviewRequest(validInterview!, message))
+            : formatSubagentMessage(reason === "need_decision" ? "ask" : "update", message!);
+          deliverLocalSubagentRelayMessage("subagent-control", reason === "progress_update" ? "update" : "needs_attention", localMsg);
+          if (reason === "progress_update") return { content: [{ type: "text", text: `Progress update delivered locally to ${orchestratorTarget}` }] };
+          // Can't block for local reply in same process — return the formatted question
+          return { content: [{ type: "text", text: `Delivered locally to supervisor. Cannot block for reply in same process.` }] };
+        }
+
         let client: BrokerClient;
         try { client = await ensureBrokerConnected("tool"); } catch (e: any) {
           return { content: [{ type: "text", text: `❌ Not connected: ${e.message}` }], isError: true };
         }
 
-        const formattedMessage = [
-          reason === "need_decision" ? "Subagent needs a supervisor decision." : "Subagent progress update.",
-          `Run: ${subRunId}`,
-          `Agent: ${subAgent}`,
-          `Child index: ${subIndex}`,
-          "",
-          message,
-        ].join("\n");
+        const requestText = reason === "interview_request"
+          ? formatSubagentMessage("interview", formatInterviewRequest(validInterview!, message))
+          : formatSubagentMessage(reason === "need_decision" ? "ask" : "update", message!);
 
         if (reason === "progress_update") {
           try {
-            const result = await client.send(orchestratorTarget, { text: formattedMessage });
+            const result = await client.send(orchestratorTarget, { text: requestText });
+            pi.appendEntry?.("network_sent", { to: orchestratorTarget, message: message!.slice(0, 200), reason, timestamp: Date.now() });
             return {
               content: [{ type: "text", text: result.delivered ? `Progress update sent to supervisor ${orchestratorTarget}` : `Not delivered: ${result.reason}` }],
               isError: !result.delivered,
@@ -1761,16 +1976,30 @@ export default function extension(api: ExtensionAPI) {
           }
         }
 
-        // need_decision: block until reply
+        // need_decision or interview_request: block until reply
         if (replyWaiter) return { content: [{ type: "text", text: "Already waiting for a reply" }], isError: true };
+        if (signal?.aborted) return { content: [{ type: "text", text: "Cancelled" }], isError: true };
         const questionId = randomUUID();
+        let replyPromise: Promise<any> | null = null;
         try {
-          const sendResult = await client.send(orchestratorTarget, { text: formattedMessage, messageId: questionId, expectsReply: true });
+          replyPromise = waitForReply(orchestratorTarget, questionId, signal);
+          const sendResult = await client.send(orchestratorTarget, { text: requestText, messageId: questionId, expectsReply: true });
           if (!sendResult.delivered) {
+            if (replyWaiter?.replyTo === questionId) replyWaiter = null;
             return { content: [{ type: "text", text: `Not delivered: ${sendResult.reason}` }], isError: true };
           }
-          const reply = await waitForReply(orchestratorTarget, questionId, signal);
+          pi.appendEntry?.("network_sent", { to: orchestratorTarget, messageId: questionId, message: (message ?? "").slice(0, 200), reason, timestamp: Date.now() });
+          const reply = await replyPromise;
           const replyText = reply.message.content.text;
+
+          // Parse structured interview reply if applicable
+          if (reason === "interview_request" && validInterview) {
+            const parsed = parseInterviewReply(replyText, validInterview);
+            return {
+              content: [{ type: "text", text: `**Reply from supervisor:**\n${replyText}` }],
+              ...(parsed?.value ? { details: { structuredReply: parsed.value } } : parsed?.error ? { details: { structuredReplyParseError: parsed.error } } : {}),
+            };
+          }
           return { content: [{ type: "text", text: `**Reply from supervisor:**\n${replyText}` }] };
         } catch (e: any) {
           if (replyWaiter?.replyTo === questionId) replyWaiter = null;
@@ -1779,17 +2008,22 @@ export default function extension(api: ExtensionAPI) {
       },
       renderCall(args: any, theme: any) {
         const reason = args.reason || "contact";
-        const preview = (args.message || "").slice(0, 80);
-        const color = reason === "need_decision" ? "warning" : "muted";
+        const msgPreview = previewText(args.message, 80);
+        const color = reason === "need_decision" ? "warning" : reason === "interview_request" ? "accent" : "muted";
         let text = theme.fg("toolTitle", theme.bold("contact_supervisor ")) + theme.fg(color, reason);
-        if (preview) text += "\n  " + theme.fg("dim", preview);
+        if (args.interview?.title) text += " " + theme.fg("accent", args.interview.title.trim());
+        if (msgPreview) text += "\n  " + theme.fg("dim", msgPreview);
         return new Text(text, 0, 0);
       },
       renderResult(result: any, { isPartial }: any, theme: any) {
         if (isPartial) return new Text(theme.fg("warning", "⏳ Waiting for supervisor..."), 0, 0);
         const t = result.content?.[0]?.text ?? "";
         const failed = result.isError || t.startsWith("❌");
-        return new Text((failed ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ")) + t.replace(/^[✅❌] /, "").slice(0, 120), 0, 0);
+        const parseWarn = Boolean(result.details?.structuredReplyParseError);
+        let text = (failed ? theme.fg("error", "✗ ") : parseWarn ? theme.fg("warning", "⚠ ") : theme.fg("success", "✓ "));
+        text += theme.fg(failed ? "error" : "text", t.replace(/^[✅❌] /, "").slice(0, 120));
+        if (parseWarn) text += "\n" + theme.fg("warning", `Parse issue: ${result.details.structuredReplyParseError}`);
+        return new Text(text, 0, 0);
       },
     });
   }
@@ -1798,7 +2032,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerTool({
     name: "git_sync",
     label: "Git Sync",
-    description: "Git sync operations. Workers: create branch, commit, push. Manager: fetch, list branches, merge, consolidate conflicts. Use this tool when you need to manage git branches for cross-agent code coordination.",
+    description: "Git branch coordination. Workers: branch/commit/push. Manager: fetch/merge/consolidate.",
     promptSnippet: "Sync git branch",
     parameters: Type.Object({
       action: StringEnum(["status", "branch", "commit", "push", "fetch", "branches", "diff", "merge", "consolidate", "abort"], { description: "Git sync action to perform" }),
@@ -1910,7 +2144,7 @@ export default function extension(api: ExtensionAPI) {
   // ─── Slash commands ───
   pi.registerCommand({
     name: "git-sync",
-    description: "Git sync operations: status, fetch, branches, merge <branch>, diff <branch>, consolidate <branch>. Manager-only: merge, consolidate.",
+    description: "Git sync: status/fetch/branches/merge/diff/consolidate. Manager-only: merge, consolidate.",
     async execute(args, ctx) {
       const parts = (args || "").trim().split(/\s+/);
       const subcommand = parts[0] || "status";

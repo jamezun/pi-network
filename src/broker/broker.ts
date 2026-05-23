@@ -9,7 +9,27 @@ import { join } from "path";
 import { randomUUID } from "crypto";
 import { writeMessage, createMessageReader } from "./framing";
 import { getBrokerSocketPath, getBrokerPidPath, getBrokerDir } from "./paths";
-import type { SessionInfo, BrokerMessage, ServerMessage } from "./types";
+import type { SessionInfo, BrokerMessage, Attachment, ServerMessage } from "./types";
+
+function isAttachment(value: unknown): value is Attachment {
+  if (typeof value !== "object" || value === null) return false;
+  const a = value as Record<string, unknown>;
+  if (a.type !== "file" && a.type !== "snippet" && a.type !== "context") return false;
+  if (typeof a.name !== "string" || typeof a.content !== "string") return false;
+  return a.language === undefined || typeof a.language === "string";
+}
+
+function isBrokerMessage(value: unknown): value is BrokerMessage {
+  if (typeof value !== "object" || value === null) return false;
+  const m = value as Record<string, unknown>;
+  if (typeof m.id !== "string" || typeof m.timestamp !== "number") return false;
+  if (m.replyTo !== undefined && typeof m.replyTo !== "string") return false;
+  if (m.expectsReply !== undefined && typeof m.expectsReply !== "boolean") return false;
+  if (typeof m.content !== "object" || m.content === null) return false;
+  const c = m.content as Record<string, unknown>;
+  if (typeof c.text !== "string") return false;
+  return c.attachments === undefined || (Array.isArray(c.attachments) && c.attachments.every(isAttachment));
+}
 
 const BROKER_DIR = getBrokerDir();
 const SOCKET_PATH = getBrokerSocketPath();
@@ -18,16 +38,6 @@ const PID_PATH = getBrokerPidPath();
 interface ConnectedSession {
   socket: net.Socket;
   info: SessionInfo;
-}
-
-function isBrokerMessage(value: unknown): value is BrokerMessage {
-  if (typeof value !== "object" || value === null) return false;
-  const m = value as Record<string, unknown>;
-  if (typeof m.id !== "string" || typeof m.timestamp !== "number") return false;
-  if (typeof m.content !== "object" || m.content === null) return false;
-  const c = m.content as Record<string, unknown>;
-  if (typeof c.text !== "string") return false;
-  return true;
 }
 
 function isSessionRegistration(value: unknown): value is Omit<SessionInfo, "id"> {
