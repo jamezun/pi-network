@@ -4,6 +4,7 @@
 
 import type { BridgeConfig } from "./core/config";
 import type { Transport } from "./transport/index";
+import type { WhatsAppTransport } from "./transport/whatsapp";
 import type { TaskEnvelope, TaskResult } from "./core/tasks";
 import { formatHelpText } from "./core/command-parser";
 import type { ParsedCommand } from "./core/command-parser";
@@ -38,13 +39,14 @@ export class WhatsAppBridge {
   private waConfig: WhatsAppBridgeConfig;
   private security: WhatsAppSecurity;
   private notifier: WhatsAppNotifier;
-  private transport: Transport;
+  private meshTransport: Transport;
+  private waTransport: WhatsAppTransport | null = null;
   private running = false;
 
   constructor(config: BridgeConfig, transport: Transport) {
     this.config = config;
     this.waConfig = (config as any).whatsapp as WhatsAppBridgeConfig;
-    this.transport = transport;
+    this.meshTransport = transport;
 
     this.security = new WhatsAppSecurity({
       allowedNumbers: this.waConfig.allowedNumbers,
@@ -65,14 +67,21 @@ export class WhatsAppBridge {
     if (!this.waConfig?.enabled) return;
     this.running = true;
 
-    // Register transport message handler
-    this.transport.onMessage((msg) => this.handleInboundMessage(msg));
+    // Create a dedicated WhatsApp transport for inbound command handling
+    const { WhatsAppTransport } = await import("./transport/whatsapp");
+    this.waTransport = new WhatsAppTransport(this.config);
+    this.waTransport.onMessage((msg) => this.handleInboundMessage(msg));
+    await this.waTransport.start();
 
     console.log("WhatsApp bridge started");
   }
 
   async stop(): Promise<void> {
     this.running = false;
+    if (this.waTransport) {
+      await this.waTransport.stop();
+      this.waTransport = null;
+    }
   }
 
   private async handleInboundMessage(msg: any): Promise<void> {
@@ -169,7 +178,7 @@ export class WhatsAppBridge {
       userId: from,
     };
 
-    const result = await this.transport.send(parsed.peer, envelope);
+    const result = await this.meshTransport.send(parsed.peer, envelope);
     if (result.delivered) {
       await this.sendReply(from, `📤 Task sent to ${parsed.peer}. Result will follow.`);
     } else {
@@ -213,7 +222,7 @@ export class WhatsAppBridge {
         hops: 0,
         userId: from,
       };
-      await this.transport.send(agent.name, envelope).catch(() => {});
+      await this.meshTransport.send(agent.name, envelope).catch(() => {});
     }
 
     await this.sendReply(from, `📢 Broadcast sent to ${agents.length} peer(s)`);
@@ -242,7 +251,7 @@ export class WhatsAppBridge {
     // Send kill to all peers
     const agents = loadRegistry().filter(a => a.status === "online");
     for (const agent of agents) {
-      await this.transport.sendKill(agent.name, taskId).catch(() => {});
+      await this.meshTransport.sendKill(agent.name, taskId).catch(() => {});
     }
     await this.sendReply(from, `🔪 Kill signal sent for ${taskId}`);
   }

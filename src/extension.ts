@@ -30,8 +30,7 @@ import type { BridgeConfig, NetworkMode, AgentStatus } from "./core/config";
 import { createEnvelope, extractResultFromMessages } from "./core/tasks";
 import type { TaskEnvelope, TaskResult } from "./core/tasks";
 import { createTransport } from "./transport";
-import type { Transport } from "./transport";
-import { ConcurrencyManager } from "./core/concurrency";
+import type { Transport } from "./transport";import { ConcurrencyManager } from "./core/concurrency";
 import { acquireLock, releaseAllForTask, checkFileLock, getAllLocks, getLocksForFile } from "./core/locks";
 import {
   loadRegistry, updateAgentInRegistry, pruneDeadEntries,
@@ -54,7 +53,6 @@ import { IdleQueue } from "./core/idle-queue";
 import { loadConfirmConfig, shouldConfirm, formatConfirmPrompt } from "./core/confirm-send";
 import { PresenceManager } from "./core/presence";
 import { ReplyTracker } from "./core/reply-tracker";
-import { createWhatsAppTransport } from "./transport/index";
 import { WhatsAppBridge } from "./whatsapp-bridge";
 import { formatResultInline } from "./ui/inline-message";
 import type { PersonaDef } from "./core/personas";
@@ -468,10 +466,75 @@ export default function extension(api: ExtensionAPI) {
     transport = createTransport(mode, config);
     await transport.start();
     concurrency = new ConcurrencyManager(config);
+    idleQueue = new IdleQueue();
+    presenceManager = new PresenceManager();
+    replyTracker = new ReplyTracker();
     startLocalBridge(config.bridgePort);
     startHeartbeat();
     startPruneLoop();
     startPendingTasksCleanup();
+
+    // ─── Phase 1.1: Auto-discovery broker ───
+    try {
+      await spawnBrokerIfNeeded();
+      brokerClient = new BrokerClient();
+      await brokerClient.connect({
+        cwd: ctx.cwd,
+        model: ctx.model?.id || "unknown",
+        pid: process.pid,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+        name: config.localName,
+        status: "online",
+        role: config.role as "manager" | "worker",
+        capabilities: config.capabilities,
+        specialties: config.specialties,
+        color: config.color,
+        purpose: config.purpose,
+        project: config.project,
+      });
+      brokerClient.on("message", (from, message) => {
+        const turnCtx = replyTracker.recordIncomingMessage(from, message);
+        replyTracker.queueTurnContext(turnCtx);
+        pi.sendMessage({
+          customType: "network-inbound",
+          content: formatResultInline({
+            taskId: "", rootTaskId: "", from: from.name || from.id,
+            fromSession: from.id, deliverTo: config.localName, deliverToSession: "",
+            result: message.content.text, files: [], chain: [],
+            originInstructor: from.name || from.id, originSession: from.id,
+            needsConsolidation: false, isConsolidated: false, partialResults: [],
+            status: "completed",
+          }),
+          display: true,
+        }, { triggerTurn: message.expectsReply ?? false });
+      });
+      brokerClient.on("session_joined", (session) => {
+        ctx.ui.notify(`🟢 ${session.name || session.id} joined the mesh`, "info");
+        agents = loadRegistry();
+      });
+      brokerClient.on("session_left", (sessionId) => {
+        ctx.ui.notify(`🔴 ${sessionId} left the mesh`, "info");
+        agents = loadRegistry();
+      });
+      ctx.ui.notify("🔗 Connected to auto-discovery broker", "info");
+    } catch (e: any) {
+      ctx.ui.notify(`⚠️ Broker unavailable: ${e.message} (continuing without auto-discovery)`, "warning");
+      brokerClient = null;
+    }
+
+    // ─── Phase 2.4: WhatsApp bridge ───
+    try {
+      const waCfg = (config as any).whatsapp;
+      if (waCfg?.enabled) {
+        whatsappBridge = new WhatsAppBridge(config, transport);
+        await whatsappBridge.start();
+        ctx.ui.notify("📱 WhatsApp bridge started", "info");
+      }
+    } catch (e: any) {
+      ctx.ui.notify(`⚠️ WhatsApp bridge failed: ${e.message}`, "warning");
+      whatsappBridge = null;
+    }
 
     updateAgentInRegistry(agents, {
       name: config.localName, role: config.role,
@@ -530,7 +593,12 @@ export default function extension(api: ExtensionAPI) {
         } else {
           const envelope = msg.payload as TaskEnvelope;
           const action = concurrency.enqueue(envelope);
-          if (action === "running") injectTask(envelope);
+          if (action === "running") {
+            injectTask(envelope);
+          } else if (action === "queued") {
+            // Phase 1.2: Also add to idle queue for idle-aware delivery
+            idleQueue.enqueue(envelope);
+          }
         }
       } else if (msg.type === "registry_update") {
         agents = loadRegistry();
@@ -738,10 +806,10 @@ export default function extension(api: ExtensionAPI) {
       // Phase 1.6: Confirm-before-send
       const confirmCfg = loadConfirmConfig(config);
       const isBroadcast = peer === "all" || peer === "broadcast";
-      if (shouldConfirm(confirmCfg, isBroadcast) && ctx.confirm) {
+      if (shouldConfirm(confirmCfg, isBroadcast) && ctx.ui?.confirm) {
         const cfmPrompt = formatConfirmPrompt(peer, task, isBroadcast);
         try {
-          const confirmed = await ctx.confirm(cfmPrompt, { timeout: confirmCfg.confirmTimeoutMs });
+          const confirmed = await ctx.ui.confirm(cfmPrompt, { timeout: confirmCfg.confirmTimeoutMs });
           if (!confirmed) {
             return { content: [{ type: "text", text: "❌ Task send cancelled." }] };
           }
@@ -888,6 +956,21 @@ export default function extension(api: ExtensionAPI) {
       );
       if (!hopCheck.allowed) {
         return { content: [{ type: "text", text: `❌ Hop limit reached (${hopCheck.hops} >= ${hopCheck.maxHops})` }] };
+      }
+
+      // Phase 1.6: Confirm-before-send
+      const rConfirmCfg = loadConfirmConfig(config);
+      const rIsBroadcast = peer === "all" || peer === "broadcast";
+      if (shouldConfirm(rConfirmCfg, rIsBroadcast) && ctx.ui?.confirm) {
+        const rPrompt = formatConfirmPrompt(peer, task, rIsBroadcast);
+        try {
+          const confirmed = await ctx.ui.confirm(rPrompt, { timeout: rConfirmCfg.confirmTimeoutMs });
+          if (!confirmed) {
+            return { content: [{ type: "text", text: "❌ Task send cancelled." }] };
+          }
+        } catch {
+          return { content: [{ type: "text", text: "❌ Confirmation timed out. Task not sent." }] };
+        }
       }
 
       onUpdate?.({ content: [{ type: "text", text: `Sending task to ${peer}...` }] });
