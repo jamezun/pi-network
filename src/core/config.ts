@@ -5,7 +5,7 @@ import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 
-export type NetworkMode = "tailscale" | "server" | "hybrid" | "local";
+export type NetworkMode = "tailscale" | "server" | "hybrid" | "local" | "whatsapp";
 export type AgentRole = "manager" | "worker";
 export type TaskPriority = "urgent" | "high" | "normal" | "low";
 export type TaskStatus = "queued" | "running" | "completed" | "failed" | "killed" | "reassigned" | "waiting_for_answer";

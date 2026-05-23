@@ -36,3 +36,14 @@ export function createTransport(mode: NetworkMode, config: BridgeConfig): Transp
       throw new Error(`Unknown mode: ${mode}`);
   }
 }
+
+/**
+ * Create a WhatsApp transport if configured.
+ * Returns null if WhatsApp is not enabled.
+ */
+export function createWhatsAppTransport(config: BridgeConfig): Transport | null {
+  const waConfig = (config as any).whatsapp;
+  if (!waConfig?.enabled) return null;
+  const { WhatsAppTransport } = require("./whatsapp");
+  return new WhatsAppTransport(config) as Transport;
+}
