@@ -18,6 +18,7 @@
 //   - Bounded socket reads (64KB line cap)
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { resolve, join, dirname } from "node:path";
@@ -54,7 +55,9 @@ import { loadConfirmConfig, shouldConfirm, formatConfirmPrompt } from "./core/co
 import { PresenceManager } from "./core/presence";
 import { ReplyTracker } from "./core/reply-tracker";
 import { WhatsAppBridge } from "./whatsapp-bridge";
-import { formatResultInline } from "./ui/inline-message";
+import { NetworkInlineMessage, makeMessageDetails } from "./ui/inline-message";
+import { PeerListOverlay } from "./ui/session-list";
+import { NetworkComposeOverlay } from "./ui/compose";
 import type { PersonaDef } from "./core/personas";
 import { ulid } from "./core/ulid";
 import { GitSyncManager, loadGitSyncConfig } from "./core/git-sync";
@@ -241,6 +244,7 @@ function startLocalBridge(port: number) {
         customType: "bridge-clarification",
         content: `💬 ${from} asks: ${question}`,
         display: true,
+        details: makeMessageDetails("clarification", from, question, { taskId }),
       }, { triggerTurn: true });
       return;
     }
@@ -376,7 +380,7 @@ function deliverResult(result: TaskResult) {
     customType: "bridge-result",
     content: message,
     display: true,
-    details: result,
+    details: makeMessageDetails("task_result", result.from, result.result, { taskId: result.taskId, hops: result.hops }),
   }, { triggerTurn: true });
 
   // Phase 2.4: Deliver to WhatsApp if needed
@@ -498,17 +502,14 @@ export default function extension(api: ExtensionAPI) {
       brokerClient.on("message", (from, message) => {
         const turnCtx = replyTracker.recordIncomingMessage(from, message);
         replyTracker.queueTurnContext(turnCtx);
+        const inboundFrom = from.name || from.id;
         pi.sendMessage({
           customType: "network-inbound",
-          content: formatResultInline({
-            taskId: "", rootTaskId: "", from: from.name || from.id,
-            fromSession: from.id, deliverTo: config.localName, deliverToSession: "",
-            result: message.content.text, files: [], chain: [],
-            originInstructor: from.name || from.id, originSession: from.id,
-            needsConsolidation: false, isConsolidated: false, partialResults: [],
-            status: "completed",
-          }),
+          content: message.content.text,
           display: true,
+          details: makeMessageDetails("inbound_task", inboundFrom, message.content.text, {
+            replyCommand: message.expectsReply ? "intercom({ action: \"reply\", message: \"...\" })" : undefined,
+          }),
         }, { triggerTurn: message.expectsReply ?? false });
       });
       brokerClient.on("session_joined", (session) => {
@@ -605,7 +606,7 @@ export default function extension(api: ExtensionAPI) {
         if (msg.payload.type === "result") {
           deliverResult(msg.payload);
         } else if (msg.payload.type === "file") {
-          pi.sendMessage({ customType: "bridge-file", content: `📂 File from ${msg.from}: ${msg.payload.filename}`, display: true });
+          pi.sendMessage({ customType: "bridge-file", content: `📂 File from ${msg.from}: ${msg.payload.filename}`, display: true, details: makeMessageDetails("file_received", msg.from, msg.payload.filename) });
         } else {
           const envelope = msg.payload as TaskEnvelope;
           const action = concurrency.enqueue(envelope);
@@ -790,6 +791,7 @@ export default function extension(api: ExtensionAPI) {
           customType: "network-queued",
           content: `📋 Queued task from ${msg.envelope.originInstructor}: ${msg.envelope.task.slice(0, 100)}`,
           display: true,
+          details: makeMessageDetails("queued", msg.envelope.originInstructor, msg.envelope.task.slice(0, 200), { taskId: msg.envelope.taskId }),
         }, { triggerTurn: false });
         injectTask(msg.envelope);
       }
@@ -1498,6 +1500,27 @@ export default function extension(api: ExtensionAPI) {
     },
   });
 
+  // ─── Message renderers (framed inline messages) ───
+  const NETWORK_MESSAGE_TYPES = [
+    "network-inbound",
+    "network-queued",
+    "network-result",
+    "bridge-clarification",
+    "bridge-result",
+    "bridge-file",
+  ];
+
+  for (const customType of NETWORK_MESSAGE_TYPES) {
+    pi.registerMessageRenderer(customType, (message, _options, theme) => {
+      const details = message.details as ReturnType<typeof makeMessageDetails> | undefined;
+      if (details) {
+        return new NetworkInlineMessage(details, theme);
+      }
+      // Fallback: plain text
+      return new Text(message.content || "", 0, 0);
+    });
+  }
+
   // ─── Slash commands ───
   pi.registerCommand({
     name: "git-sync",
@@ -1608,9 +1631,80 @@ export default function extension(api: ExtensionAPI) {
 
   pi.registerCommand({
     name: "network",
-    description: "Show network status, manage peers. Flags: --all (show all projects), --project=NAME (filter), --prune (force prune)",
+    description: "Network operations: status, send (compose message to peer), manage peers. Flags: --all, --project=NAME, --prune",
     async execute(args, ctx) {
-      const flags = (args || "").trim().split(/\s+/).filter(Boolean);
+      const parts = (args || "").trim().split(/\s+/);
+      const subcommand = parts[0];
+
+      // /network send → pick peer and compose message
+      if (subcommand === "send") {
+        if (!ctx.hasUI) {
+          ctx.ui.notify("❌ /network send requires interactive TUI", "warning");
+          return;
+        }
+        agents = loadRegistry();
+        const onlinePeers = agents.filter(a => a.name !== config.localName && a.status === "online");
+        if (onlinePeers.length === 0) {
+          ctx.ui.notify("No peers online to message", "warning");
+          return;
+        }
+
+        try {
+          // Step 1: Pick a peer
+          const pick = await ctx.ui.custom<{ peer: AgentEntry } | undefined>(
+            (_tui, theme, keybindings, done) =>
+              new PeerListOverlay(theme, keybindings, config.localName, onlinePeers, done),
+            { overlay: true },
+          );
+          if (!pick?.peer) return;
+
+          // Step 2: Compose message
+          const composeResult = await ctx.ui.custom<{ sent: boolean; text?: string; mode?: string }>(
+            (tui, theme, keybindings, done) =>
+              new NetworkComposeOverlay(tui, theme, keybindings, pick.peer, done),
+            { overlay: true },
+          );
+
+          if (composeResult?.sent && composeResult.text) {
+            // Send the task via transport
+            const envelope: TaskEnvelope = {
+              taskId: ulid(),
+              rootTaskId: "",
+              task: composeResult.text,
+              from: config.localName,
+              fromSession: config.localName,
+              deliverTo: pick.peer.name,
+              deliverToSession: pick.peer.name,
+              hops: 0,
+              originInstructor: config.localName,
+              originSession: config.localName,
+              createdAt: Date.now(),
+              mode: (composeResult.mode || "agent") as TaskMode,
+              priority: "normal",
+              status: "running",
+              needsConsolidation: false,
+              isConsolidated: false,
+              partialResults: [],
+              chain: [],
+              result: "",
+              files: [],
+            };
+
+            try {
+              await transport.send(pick.peer.name, envelope);
+              ctx.ui.notify(`✉️ Task sent to ${pick.peer.name}`, "info");
+              appendAudit({ event: "task_sent", sender: config.localName, recipient: pick.peer.name, taskId: envelope.taskId, hops: 0 });
+            } catch (e: any) {
+              ctx.ui.notify(`❌ Failed to send: ${e.message}`, "error");
+            }
+          }
+        } catch {
+          // Overlay cancelled or errored
+        }
+        return;
+      }
+
+      const flags = parts;
       const explicitProject = flags.find((f) => f.startsWith("--project="))?.split("=")[1];
       const showAll = flags.includes("--all");
       const forcePrune = flags.includes("--prune");
@@ -1651,6 +1745,53 @@ export default function extension(api: ExtensionAPI) {
       lines.push(`  WhatsApp: ${whatsappBridge ? "🟢 active" : "⬜ off"} | Presence: ${presenceManager.formatState()}`);
       if (gitSync) lines.push(`  Git: ${gitSync.getStatus()}`);
       ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  // ─── Keyboard shortcut ───
+  pi.registerShortcut("alt+m", {
+    description: "Open network compose (send message to mesh peer)",
+    handler: async (ctx) => {
+      agents = loadRegistry();
+      const onlinePeers = agents.filter(a => a.name !== config.localName && a.status === "online");
+      if (onlinePeers.length === 0) {
+        ctx.ui.notify("No peers online to message", "warning");
+        return;
+      }
+      try {
+        const pick = await ctx.ui.custom<{ peer: AgentEntry } | undefined>(
+          (_tui, theme, keybindings, done) =>
+            new PeerListOverlay(theme, keybindings, config.localName, onlinePeers, done),
+          { overlay: true },
+        );
+        if (!pick?.peer) return;
+
+        const composeResult = await ctx.ui.custom<{ sent: boolean; text?: string; mode?: string }>(
+          (tui, theme, keybindings, done) =>
+            new NetworkComposeOverlay(tui, theme, keybindings, pick.peer, done),
+          { overlay: true },
+        );
+
+        if (composeResult?.sent && composeResult.text) {
+          const envelope: TaskEnvelope = {
+            taskId: ulid(), rootTaskId: "",
+            task: composeResult.text,
+            from: config.localName, fromSession: config.localName,
+            deliverTo: pick.peer.name, deliverToSession: pick.peer.name,
+            hops: 0, originInstructor: config.localName, originSession: config.localName,
+            createdAt: Date.now(), mode: (composeResult.mode || "agent") as TaskMode,
+            priority: "normal", status: "running",
+            needsConsolidation: false, isConsolidated: false, partialResults: [],
+            chain: [], result: "", files: [],
+          };
+          try {
+            await transport.send(pick.peer.name, envelope);
+            ctx.ui.notify(`✉️ Task sent to ${pick.peer.name}`, "info");
+          } catch (e: any) {
+            ctx.ui.notify(`❌ Failed: ${e.message}`, "error");
+          }
+        }
+      } catch {}
     },
   });
 }
