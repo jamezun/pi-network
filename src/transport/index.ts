@@ -3,6 +3,11 @@
 import type { BridgeConfig, NetworkMode } from "../core/config";
 import type { TaskEnvelope, TaskResult } from "../core/tasks";
 import type { FilePayload } from "../core/files";
+import { TailscaleTransport } from "./tailscale";
+import { ServerTransport } from "./server";
+import { HybridTransport } from "./hybrid";
+import { LocalTransport } from "./local";
+import { WhatsAppTransport } from "./whatsapp";
 
 export interface SendResult {
   delivered: boolean;
@@ -25,13 +30,15 @@ export interface Transport {
 export function createTransport(mode: NetworkMode, config: BridgeConfig): Transport {
   switch (mode) {
     case "tailscale":
-      return new (require("./tailscale").TailscaleTransport)(config);
+      return new TailscaleTransport(config);
     case "server":
-      return new (require("./server").ServerTransport)(config);
+      return new ServerTransport(config);
     case "hybrid":
-      return new (require("./hybrid").HybridTransport)(config);
+      return new HybridTransport(config);
     case "local":
-      return new (require("./local").LocalTransport)(config);
+      return new LocalTransport(config);
+    case "whatsapp":
+      return new WhatsAppTransport(config);
     default:
       throw new Error(`Unknown mode: ${mode}`);
   }
@@ -44,6 +51,5 @@ export function createTransport(mode: NetworkMode, config: BridgeConfig): Transp
 export function createWhatsAppTransport(config: BridgeConfig): Transport | null {
   const waConfig = (config as any).whatsapp;
   if (!waConfig?.enabled) return null;
-  const { WhatsAppTransport } = require("./whatsapp");
-  return new WhatsAppTransport(config) as Transport;
+  return new WhatsAppTransport(config);
 }

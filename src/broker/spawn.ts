@@ -4,10 +4,8 @@
 import { spawn } from "child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
-import { fileURLToPath } from "url";
-import { homedir } from "os";
 import net from "net";
-import { getBrokerSocketPath, getBrokerPidPath, getBrokerSpawnLockPath, getBrokerDir } from "./paths.js";
+import { getBrokerSocketPath, getBrokerPidPath, getBrokerSpawnLockPath, getBrokerDir } from "./paths";
 
 const BROKER_DIR = getBrokerDir();
 const BROKER_SOCKET = getBrokerSocketPath();
@@ -103,7 +101,7 @@ export async function spawnBrokerIfNeeded(brokerCommand = "npx", brokerArgs = ["
     if (await isBrokerRunning()) return;
 
     // Resolve broker.ts path relative to this file
-    const brokerPath = join(dirname(fileURLToPath(import.meta.url)), "broker.ts");
+    const brokerPath = join(__dirname, "broker.ts");
 
     const child = spawn(brokerCommand, [...brokerArgs, brokerPath], {
       detached: true,

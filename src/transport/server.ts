@@ -45,7 +45,7 @@ export class ServerTransport implements Transport {
     await fetch(`${this.config.server!.url}/file/upload`, {
       method: "POST",
       headers: this.authHeaders(),
-      body: JSON.stringify({ to: peer, from: this.config.localName, ...file }),
+      body: JSON.stringify({ ...file, to: peer, from: this.config.localName }),
     });
   }
 

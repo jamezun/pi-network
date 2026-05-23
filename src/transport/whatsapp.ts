@@ -6,7 +6,6 @@ import type { TaskEnvelope, TaskResult } from "../core/tasks";
 import type { FilePayload } from "../core/files";
 import type { Transport, SendResult } from "./index";
 import { parseCommand } from "../core/command-parser";
-import type { ParsedCommand } from "../core/command-parser";
 
 export interface WhatsAppConfig {
   enabled: boolean;
@@ -152,6 +151,7 @@ export class WhatsAppTransport implements Transport {
   }
 
   private processInboundMessage(msg: EvolutionMessage): void {
+    if (!msg || !msg.key || typeof msg.key.remoteJid !== "string") return;
     if (msg.key.fromMe) return;
     if (!this.messageHandler) return;
 
@@ -230,6 +230,8 @@ export class WhatsAppTransport implements Transport {
   private formatResultMessage(result: TaskResult): string {
     const icon = result.status === "completed" ? "✅" : result.status === "failed" ? "❌" : "📬";
     const preview = result.result.length > 800 ? result.result.slice(0, 800) + "…" : result.result;
-    return `${icon} *Result from ${result.from}*\n\n${preview}\n\n_Completed in ${Date.now() - (result as any).timestamp ?? 0}ms_`;
+    const startedAt = (result as any).timestamp ?? Date.now();
+    const elapsedMs = Date.now() - startedAt;
+    return `${icon} *Result from ${result.from}*\n\n${preview}\n\n_Completed in ${elapsedMs}ms_`;
   }
 }

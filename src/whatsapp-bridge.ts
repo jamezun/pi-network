@@ -2,20 +2,20 @@
 // Phase 2.4: Core loop connecting WhatsApp to the mesh network.
 // Receives WhatsApp messages → filters → parses → routes → returns results.
 
-import type { BridgeConfig } from "./config";
-import type { Transport, SendResult } from "../transport/index";
-import type { TaskEnvelope, TaskResult } from "./tasks";
-import { parseCommand, formatHelpText } from "./command-parser";
-import type { ParsedCommand } from "./command-parser";
-import { WhatsAppSecurity } from "./whatsapp-security";
-import { WhatsAppNotifier } from "./whatsapp-notify";
+import type { BridgeConfig } from "./core/config";
+import type { Transport } from "./transport/index";
+import type { TaskEnvelope, TaskResult } from "./core/tasks";
+import { formatHelpText } from "./core/command-parser";
+import type { ParsedCommand } from "./core/command-parser";
+import { WhatsAppSecurity } from "./core/whatsapp-security";
+import { WhatsAppNotifier } from "./core/whatsapp-notify";
 import {
+  formatTaskResult,
   formatNetworkStatus, formatTaskHistory, formatPeerList,
   formatError, formatOfflinePeer, formatUnknownPeer, formatParseError,
-} from "./whatsapp-formatter";
-import { loadRegistry } from "./registry";
-import { readHistory } from "./task-history";
-import { appendAudit } from "./audit";
+} from "./core/whatsapp-formatter";
+import { loadRegistry } from "./core/registry";
+import { readHistory } from "./core/task-history";
 
 interface WhatsAppBridgeConfig {
   enabled: boolean;
@@ -141,6 +141,7 @@ export class WhatsAppBridge {
 
     if (peer.status === "offline") {
       await this.sendReply(from, formatOfflinePeer(parsed.peer));
+      return;
     }
 
     // Create and send envelope via transport

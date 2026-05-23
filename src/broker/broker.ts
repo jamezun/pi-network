@@ -7,9 +7,9 @@ import net from "net";
 import { writeFileSync, unlinkSync, mkdirSync } from "fs";
 import { join } from "path";
 import { randomUUID } from "crypto";
-import { writeMessage, createMessageReader } from "./framing.js";
-import { getBrokerSocketPath, getBrokerPidPath, getBrokerDir } from "./paths.js";
-import type { SessionInfo, BrokerMessage, ServerMessage } from "./types.js";
+import { writeMessage, createMessageReader } from "./framing";
+import { getBrokerSocketPath, getBrokerPidPath, getBrokerDir } from "./paths";
+import type { SessionInfo, BrokerMessage, ServerMessage } from "./types";
 
 const BROKER_DIR = getBrokerDir();
 const SOCKET_PATH = getBrokerSocketPath();
@@ -134,9 +134,14 @@ class NetworkBroker {
       }
 
       case "send": {
+        if (currentId === null) return;
         const message = clientMsg.message;
         if (typeof clientMsg.to !== "string" || !isBrokerMessage(message)) {
-          writeMessage(socket, { type: "delivery_failed", messageId: message?.id ?? "unknown", reason: "Invalid message" });
+          let failId = "unknown";
+          if (message && typeof message === "object" && typeof (message as { id?: unknown }).id === "string") {
+            failId = (message as { id: string }).id;
+          }
+          writeMessage(socket, { type: "delivery_failed", messageId: failId, reason: "Invalid message" });
           break;
         }
         const targets = this.findSessions(clientMsg.to);
@@ -157,6 +162,7 @@ class NetworkBroker {
       }
 
       case "presence": {
+        if (currentId === null) return;
         const session = this.sessions.get(currentId);
         if (session) {
           if (typeof clientMsg.name === "string") session.info.name = clientMsg.name;

@@ -42,10 +42,11 @@ export function validateSupervisorInterviewRequest(input: unknown):
   const questions: SupervisorInterviewQuestion[] = [];
 
   for (let i = 0; i < raw.questions.length; i++) {
-    const q = raw.questions[i];
-    if (!q || typeof q !== "object" || Array.isArray(q)) {
+    const qRaw = raw.questions[i];
+    if (!qRaw || typeof qRaw !== "object" || Array.isArray(qRaw)) {
       return { ok: false, error: `interview.questions[${i}] must be an object` };
     }
+    const q = qRaw as Record<string, unknown>;
 
     if (typeof q.id !== "string" || q.id.trim() === "") {
       return { ok: false, error: `interview.questions[${i}].id must be a non-empty string` };
@@ -72,8 +73,9 @@ export function validateSupervisorInterviewRequest(input: unknown):
         if (typeof opt === "string") {
           if (!opt.trim()) return { ok: false, error: `interview.questions[${i}].options[${j}] must not be empty` };
           options.push(opt.trim());
-        } else if (opt && typeof opt === "object" && !Array.isArray(opt) && typeof (opt as any).label === "string") {
-          options.push({ ...opt, label: (opt as any).label.trim() });
+        } else if (opt && typeof opt === "object" && !Array.isArray(opt) && typeof (opt as { label?: unknown }).label === "string") {
+          const label = (opt as { label: string }).label;
+          options.push({ ...(opt as Record<string, unknown>), label: label.trim() });
         } else {
           return { ok: false, error: `interview.questions[${i}].options[${j}] must be a non-empty string or { label }` };
         }
@@ -88,7 +90,7 @@ export function validateSupervisorInterviewRequest(input: unknown):
       ...q,
       id,
       type: q.type as SupervisorInterviewQuestion["type"],
-      question: q.question.trim(),
+      question: (q.question as string).trim(),
       ...(options ? { options } : {}),
     });
   }

@@ -40,13 +40,13 @@ export function parseCommand(input: string, prefix = "/"): ParsedCommand {
     const spaceIdx = body.indexOf(" ");
     if (spaceIdx < 0) return { type: "unknown", raw: input };
     const peer = body.slice(1, spaceIdx);
-    const task = body.slice(spaceIdx + 1).trim();
-    if (!task) return { type: "unknown", raw: input };
+    const rest = body.slice(spaceIdx + 1).trim();
+    if (!rest) return { type: "unknown", raw: input };
     return {
       type: "task",
       peer,
-      task,
-      options: parseFlags(task),
+      task: stripFlags(rest),
+      options: parseFlags(rest),
       raw: input,
     };
   }
