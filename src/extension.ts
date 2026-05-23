@@ -48,6 +48,15 @@ import { appendAudit, formatAudit, readAudit } from "./core/audit";
 import { evaluateToolCall, formatBlockMessage, formatAskMessage, loadRules } from "./core/damage-control";
 import type { DamageControlRules } from "./core/damage-control";
 import { loadPersonaFiles } from "./core/personas";
+import { BrokerClient } from "./broker/client";
+import { spawnBrokerIfNeeded } from "./broker/spawn";
+import { IdleQueue } from "./core/idle-queue";
+import { loadConfirmConfig, shouldConfirm, formatConfirmPrompt } from "./core/confirm-send";
+import { PresenceManager } from "./core/presence";
+import { ReplyTracker } from "./core/reply-tracker";
+import { createWhatsAppTransport } from "./transport/index";
+import { WhatsAppBridge } from "./whatsapp-bridge";
+import { formatResultInline } from "./ui/inline-message";
 import type { PersonaDef } from "./core/personas";
 import { ulid } from "./core/ulid";
 
@@ -96,6 +105,11 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let pruneTimer: ReturnType<typeof setInterval> | null = null;
 let pendingTasksTimer: ReturnType<typeof setInterval> | null = null;
 let pi: ExtensionAPI;
+let brokerClient: BrokerClient | null = null;
+let idleQueue: IdleQueue;
+let presenceManager: PresenceManager;
+let replyTracker: ReplyTracker;
+let whatsappBridge: WhatsAppBridge | null = null;
 
 // Max age for an unresolved pendingTasks entry (1 hour).
 // task_await default timeout is 30 min, so 1 hour is a safe upper bound.
@@ -267,10 +281,16 @@ function startHeartbeat() {
       updateAgentInRegistry(agents, {
         name: config.localName,
         contextUsedPct: Math.round(contextPct),
-        queueLength: concurrency.getQueueLength(),
+        queueLength: concurrency.getQueueLength() + (idleQueue?.length ?? 0),
         activeTaskCount: concurrency.getRunningCount(),
         heartbeatAt: Date.now(),
       });
+      // Phase 1.8: Broadcast presence via broker
+      if (brokerClient?.isConnected()) {
+        const pUpdate = presenceManager.updateContext(Math.round(contextPct), concurrency.getQueueLength(), concurrency.getRunningCount());
+        pUpdate.agent = config.localName;
+        brokerClient.updatePresence({ status: presenceManager.formatState() });
+      }
       // Refresh local agents cache too
       agents = loadRegistry();
     } catch {}
@@ -358,6 +378,11 @@ function deliverResult(result: TaskResult) {
     display: true,
     details: result,
   }, { triggerTurn: true });
+
+  // Phase 2.4: Deliver to WhatsApp if needed
+  if (whatsappBridge) {
+    whatsappBridge.deliverResult(result).catch(() => {});
+  }
 }
 
 // ─── The Extension ───
@@ -493,6 +518,9 @@ export default function extension(api: ExtensionAPI) {
       };
     });
 
+    // ─── Phase 1.8: Presence status widget ───
+    ctx.ui.setStatus("presence", presenceManager.formatState());
+
     transport.onMessage((msg) => {
       if (msg.type === "message" && msg.payload) {
         if (msg.payload.type === "result") {
@@ -512,6 +540,8 @@ export default function extension(api: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     await transport?.stop();
+    if (brokerClient) { await brokerClient.disconnect().catch(() => {}); brokerClient = null; }
+    if (whatsappBridge) { await whatsappBridge.stop().catch(() => {}); whatsappBridge = null; }
     stopLocalBridge();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (pruneTimer) clearInterval(pruneTimer);
@@ -522,6 +552,10 @@ export default function extension(api: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, _ctx) => {
+    // Phase 1.8: Mark agent as thinking
+    presenceManager.setThinking();
+    if (brokerClient) brokerClient.updatePresence({ status: "thinking" });
+
     const tailnet = mode === "tailscale" || mode === "hybrid" ? getTailnetPeers() : null;
     const prompt = buildAgentPrompt(agents, config, mode, concurrency, localStatus, tailnet || undefined);
     if (!prompt) return;
@@ -551,6 +585,10 @@ export default function extension(api: ExtensionAPI) {
         }
       }
     }
+
+    // Phase 1.8: Tool-level presence
+    presenceManager.setToolExecuting(event.toolName);
+    if (brokerClient) brokerClient.updatePresence({ status: `tool:${event.toolName}` });
 
     // 2. File lock check for write/edit
     if (!["write", "edit"].includes(event.toolName)) return;
@@ -642,6 +680,25 @@ export default function extension(api: ExtensionAPI) {
       currentInboundHops = undefined;
       return;
     }
+
+    // Phase 1.2: Idle-aware delivery — flush queued messages when agent is idle
+    presenceManager.setIdle();
+    if (brokerClient) brokerClient.updatePresence({ status: "idle" });
+    if (idleQueue.length > 0) {
+      idleQueue.sortByPriority();
+      const pending = idleQueue.dequeueAll();
+      const first = pending.shift();
+      if (first) injectTask(first.envelope);  // first triggers a turn
+      for (const msg of pending) {
+        // subsequent messages delivered as follow-ups
+        pi.sendMessage({
+          customType: "network-queued",
+          content: `📋 Queued task from ${msg.envelope.originInstructor}: ${msg.envelope.task.slice(0, 100)}`,
+          display: true,
+        }, { triggerTurn: false });
+        injectTask(msg.envelope);
+      }
+    }
   });
 
   pi.on("message_update", async () => {
@@ -676,6 +733,21 @@ export default function extension(api: ExtensionAPI) {
       if (!hopCheck.allowed) {
         appendAudit({ event: "hop_exceeded", sender: config.localName, target: peer, hops: hopCheck.hops });
         return { content: [{ type: "text", text: `❌ Hop limit reached (${hopCheck.hops} >= ${hopCheck.maxHops}). Stopping forwarding loop.` }] };
+      }
+
+      // Phase 1.6: Confirm-before-send
+      const confirmCfg = loadConfirmConfig(config);
+      const isBroadcast = peer === "all" || peer === "broadcast";
+      if (shouldConfirm(confirmCfg, isBroadcast) && ctx.confirm) {
+        const cfmPrompt = formatConfirmPrompt(peer, task, isBroadcast);
+        try {
+          const confirmed = await ctx.confirm(cfmPrompt, { timeout: confirmCfg.confirmTimeoutMs });
+          if (!confirmed) {
+            return { content: [{ type: "text", text: "❌ Task send cancelled." }] };
+          }
+        } catch {
+          return { content: [{ type: "text", text: "❌ Confirmation timed out. Task not sent." }] };
+        }
       }
 
       onUpdate?.({ content: [{ type: "text", text: `Sending task to ${peer}...` }] });
@@ -1266,6 +1338,8 @@ export default function extension(api: ExtensionAPI) {
       if (shown === 0) lines.push("  (no peers)");
       lines.push(`\n  Local: ${concurrency.getRunningCount()}/${config.maxConcurrentTasks} tasks | ${concurrency.getQueueLength()} queued`);
       lines.push(`  Max hops: ${config.maxHops} | Damage control: ${config.damageControl ? "on" : "off"}`);
+      lines.push(`  Broker: ${brokerClient?.isConnected() ? "🟢 connected" : "🔴 disconnected"} | Idle queue: ${idleQueue.length}`);
+      lines.push(`  WhatsApp: ${whatsappBridge ? "🟢 active" : "⬜ off"} | Presence: ${presenceManager.formatState()}`);
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });

@@ -1421,6 +1421,97 @@ Relay server (server mode only):
 
 ---
 
+## Phase 1 & 2 — Auto-Discovery, WhatsApp, TUI
+
+### Auto-Discovery Broker (Phase 1.1)
+
+Zero-config local session discovery via Unix socket broker.
+
+```
+~/.pi/agent/network/broker.sock  ← auto-spawned, auto-cleaned
+```
+
+- Sessions auto-register on startup, auto-leave on shutdown
+- Messages route directly between local sessions (no HTTP overhead)
+- Broker auto-shuts down after 5s with no connected sessions
+- Falls back to HTTP-only mode if broker is unavailable
+
+### Idle-Aware Delivery (Phase 1.2)
+
+Inbound messages queue when the agent is busy, deliver when idle:
+- Priority ordering: `urgent` > `high` > `normal` > `low`
+- First queued message triggers a new agent turn
+- Follow-up messages delivered without re-triggering
+
+### Confirm-Before-Send (Phase 1.6)
+
+Optional safety prompt before sending tasks to remote agents:
+```json
+{
+  "confirmSend": {
+    "confirmSend": false,
+    "confirmBroadcast": true,
+    "confirmTimeoutMs": 30000
+  }
+}
+```
+
+### Presence Tracking (Phase 1.8)
+
+Real-time status broadcast: `idle` → `thinking` → `tool:write` → `idle`
+- Pool widget shows live tool-level status
+- `/network` shows presence for all peers
+- Heartbeat broadcasts presence every 30s via broker
+
+### Reply Threading (Phase 1.5)
+
+Conversation threading via `replyTo` message IDs:
+- `ReplyTracker` manages pending asks with auto-expiry (10 min)
+- Supports resolution by session ID or peer name
+- Thread indicators shown in inline message rendering
+
+### WhatsApp Integration (Phase 2)
+
+Control your mesh from WhatsApp via Evolution API:
+
+```
+/vps check disk space                      → send task to "vps"
+/broadcast report status                   → send to all online peers
+/status                                     → show network status
+/peers                                      → list all peers
+/history                                    → recent tasks
+/kill task-abc123                           → cancel a task
+/help                                       → command reference
+@vps can you check nginx logs              → natural language
+```
+
+**Flags:** `--priority=urgent`, `--mode=raw`, `--deliver-to=peer`
+
+**Config:**
+```json
+{
+  "whatsapp": {
+    "enabled": true,
+    "evolutionApiUrl": "http://localhost:8080",
+    "evolutionApiKey": "your-key",
+    "instanceName": "pi-network",
+    "allowedNumbers": ["+1234567890"],
+    "commandPrefix": "/",
+    "defaultReplyTarget": "whatsapp",
+    "maxMessageLength": 1000
+  }
+}
+```
+
+**Security:** phone allowlist, 10 cmds/min rate limit, 5-min replay protection, duplicate detection, forwarded message rejection.
+
+**Proactive notifications** (configurable, 30s throttle):
+- Task completion → WhatsApp notification
+- Peer status change → WhatsApp notification
+- Damage control block → WhatsApp confirmation request
+
+---
+
 ## License
 
 MIT
