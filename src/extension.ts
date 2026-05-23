@@ -23,6 +23,7 @@ import { Type } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { resolve, join, dirname } from "node:path";
 import { existsSync, readFileSync, mkdirSync, writeFile } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
 import { execSync } from "node:child_process";
 
@@ -113,6 +114,117 @@ let presenceManager: PresenceManager;
 let replyTracker: ReplyTracker;
 let whatsappBridge: WhatsAppBridge | null = null;
 let gitSync: GitSyncManager | null = null;
+
+// ─── Session lifecycle safety (ported from pi-intercom) ───
+let runtimeContext: ExtensionContext | null = null;
+let runtimeGeneration = 0;
+let shuttingDown = false;
+let disposed = true;
+let runtimeStarted = false;
+let currentSessionId: string | null = null;
+let currentModel = "unknown";
+let sessionStartedAt: number | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectAttempt = 0;
+const RECONNECT_DELAYS = [1000, 2000, 5000, 10_000, 30_000];
+
+function getLiveContext(ctx: ExtensionContext | null = runtimeContext, generation = runtimeGeneration): ExtensionContext | null {
+  if (disposed || shuttingDown || generation !== runtimeGeneration || !ctx) return null;
+  try {
+    if (currentSessionId && ctx.sessionManager.getSessionId() !== currentSessionId) return null;
+    void ctx.hasUI;
+    return ctx;
+  } catch { return null; }
+}
+
+function notifyIfLive(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error", generation = runtimeGeneration): void {
+  const live = getLiveContext(ctx, generation);
+  if (!live?.hasUI) return;
+  try { live.ui.notify(message, level); } catch {}
+}
+
+function clearReconnectTimer(): void {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+}
+
+function getReconnectDelayMs(): number {
+  return RECONNECT_DELAYS[Math.min(reconnectAttempt, RECONNECT_DELAYS.length - 1)]!;
+}
+
+function scheduleReconnect(): void {
+  if (disposed || shuttingDown || reconnectTimer) return;
+  const gen = runtimeGeneration;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (gen !== runtimeGeneration) return;
+    reconnectAttempt++;
+    ensureBrokerConnected("background").catch(() => {});
+  }, getReconnectDelayMs());
+  try { (reconnectTimer as any).unref?.(); } catch {}
+}
+
+async function ensureBrokerConnected(reason: "startup" | "background" | "tool" | "overlay"): Promise<BrokerClient> {
+  if (disposed || shuttingDown) throw new Error("Network shutting down");
+  if (brokerClient?.isConnected()) return brokerClient;
+  const ctx = getLiveContext();
+  if (!ctx || !currentSessionId) throw new Error("Network runtime not initialized");
+  clearReconnectTimer();
+
+  const nextClient = new BrokerClient();
+  brokerClient = nextClient;
+  attachBrokerClientHandlers(nextClient);
+
+  try {
+    await spawnBrokerIfNeeded();
+    await nextClient.connect({
+      name: config.localName, cwd: ctx.cwd, model: currentModel, pid: process.pid,
+      startedAt: sessionStartedAt!, lastActivity: Date.now(),
+      status: presenceManager.formatState(), role: config.role,
+      capabilities: config.capabilities, specialties: config.specialties,
+      color: config.color, purpose: config.purpose, project: config.project,
+    });
+    if (!getLiveContext()) { await nextClient.disconnect(); throw new Error("Runtime no longer active"); }
+    reconnectAttempt = 0;
+    return nextClient;
+  } catch (e) {
+    if (brokerClient === nextClient) brokerClient = null;
+    if (reason === "background") scheduleReconnect();
+    throw e;
+  }
+}
+
+function attachBrokerClientHandlers(client: BrokerClient): void {
+  client.on("message", (from, message) => {
+    const live = getLiveContext();
+    if (brokerClient !== client || !live) return;
+    handleBrokerInboundMessage(live, from, message);
+  });
+  client.on("disconnected", () => {
+    if (brokerClient !== client) return;
+    brokerClient = null;
+    if (!shuttingDown && !disposed) {
+      clearReconnectTimer();
+      scheduleReconnect();
+      const ctx = getLiveContext();
+      if (ctx?.hasUI) ctx.ui.notify("⚠️ Broker disconnected, reconnecting...", "warning");
+    }
+  });
+  client.on("session_joined", (session) => {
+    const ctx = getLiveContext();
+    if (!ctx) return;
+    notifyIfLive(ctx, `🟢 ${session.name || session.id} joined the mesh`, "info");
+    agents = loadRegistry();
+  });
+  client.on("session_left", (sessionId) => {
+    agents = loadRegistry();
+  });
+  client.on("presence_update", (session) => {
+    agents = loadRegistry();
+  });
+}
+
+// Stub — implemented later in the file, referenced by ensureBrokerConnected
+let handleBrokerInboundMessage: (ctx: ExtensionContext, from: any, message: any) => void = () => {};
 
 // Max age for an unresolved pendingTasks entry (1 hour).
 // task_await default timeout is 30 min, so 1 hour is a safe upper bound.
@@ -402,6 +514,18 @@ export default function extension(api: ExtensionAPI) {
   pi.registerFlag("explicit", { description: "Hide from auto-discovery; addressable only by exact name", type: "boolean", default: false });
 
   pi.on("session_start", async (_event, ctx) => {
+    // ─── Lifecycle safety ───
+    shuttingDown = false;
+    disposed = false;
+    runtimeStarted = true;
+    runtimeGeneration++;
+    reconnectAttempt = 0;
+    clearReconnectTimer();
+    runtimeContext = ctx;
+    currentSessionId = ctx.sessionManager.getSessionId();
+    currentModel = ctx.model?.id ?? "unknown";
+    sessionStartedAt = Date.now();
+
     // Apply CLI flag overrides
     const flagOverrides: Record<string, any> = {};
     try {
@@ -482,48 +606,12 @@ export default function extension(api: ExtensionAPI) {
 
     // ─── Phase 1.1: Auto-discovery broker ───
     try {
-      await spawnBrokerIfNeeded();
-      brokerClient = new BrokerClient();
-      await brokerClient.connect({
-        cwd: ctx.cwd,
-        model: ctx.model?.id || "unknown",
-        pid: process.pid,
-        startedAt: Date.now(),
-        lastActivity: Date.now(),
-        name: config.localName,
-        status: "online",
-        role: config.role as "manager" | "worker",
-        capabilities: config.capabilities,
-        specialties: config.specialties,
-        color: config.color,
-        purpose: config.purpose,
-        project: config.project,
-      });
-      brokerClient.on("message", (from, message) => {
-        const turnCtx = replyTracker.recordIncomingMessage(from, message);
-        replyTracker.queueTurnContext(turnCtx);
-        const inboundFrom = from.name || from.id;
-        pi.sendMessage({
-          customType: "network-inbound",
-          content: message.content.text,
-          display: true,
-          details: makeMessageDetails("inbound_task", inboundFrom, message.content.text, {
-            replyCommand: message.expectsReply ? "intercom({ action: \"reply\", message: \"...\" })" : undefined,
-          }),
-        }, { triggerTurn: message.expectsReply ?? false });
-      });
-      brokerClient.on("session_joined", (session) => {
-        ctx.ui.notify(`🟢 ${session.name || session.id} joined the mesh`, "info");
-        agents = loadRegistry();
-      });
-      brokerClient.on("session_left", (sessionId) => {
-        ctx.ui.notify(`🔴 ${sessionId} left the mesh`, "info");
-        agents = loadRegistry();
-      });
-      ctx.ui.notify("🔗 Connected to auto-discovery broker", "info");
+      await ensureBrokerConnected("startup");
+      notifyIfLive(ctx, "🔗 Connected to auto-discovery broker", "info");
     } catch (e: any) {
-      ctx.ui.notify(`⚠️ Broker unavailable: ${e.message} (continuing without auto-discovery)`, "warning");
+      notifyIfLive(ctx, `⚠️ Broker unavailable: ${e.message} (continuing without auto-discovery)`, "warning");
       brokerClient = null;
+      scheduleReconnect();
     }
 
     // ─── Phase 2.4: WhatsApp bridge ───
@@ -624,6 +712,11 @@ export default function extension(api: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    shuttingDown = true;
+    disposed = true;
+    runtimeGeneration++;
+    clearReconnectTimer();
+    replyTracker.reset();
     await transport?.stop();
     if (brokerClient) { await brokerClient.disconnect().catch(() => {}); brokerClient = null; }
     if (whatsappBridge) { await whatsappBridge.stop().catch(() => {}); whatsappBridge = null; }
@@ -632,9 +725,10 @@ export default function extension(api: ExtensionAPI) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (pruneTimer) clearInterval(pruneTimer);
     if (pendingTasksTimer) clearInterval(pendingTasksTimer);
-    // Remove the entry entirely so peers see us disappear immediately;
-    // PID-pruning would catch it eventually but ~60s later.
     try { removeRegistryEntry(config.localName); } catch {}
+    runtimeContext = null;
+    currentSessionId = null;
+    sessionStartedAt = null;
   });
 
   pi.on("before_agent_start", async (event, _ctx) => {
@@ -802,6 +896,22 @@ export default function extension(api: ExtensionAPI) {
     for (const [taskId] of activeEnvelopes) concurrency.heartbeat(taskId);
   });
 
+  // ─── Broker inbound message handler (implementation for forward reference) ───
+  handleBrokerInboundMessage = (ctx: ExtensionContext, from: any, message: any) => {
+    if (!getLiveContext(ctx)) return;
+    const turnCtx = replyTracker.recordIncomingMessage(from, message);
+    replyTracker.queueTurnContext(turnCtx);
+    const inboundFrom = from.name || from.id;
+    pi.sendMessage({
+      customType: "network-inbound",
+      content: message.content.text,
+      display: true,
+      details: makeMessageDetails("inbound_task", inboundFrom, message.content.text, {
+        replyCommand: message.expectsReply ? "network_comm({ action: \"reply\", message: \"...\" })" : undefined,
+      }),
+    }, { triggerTurn: message.expectsReply ?? false });
+  };
+
   // ─── Tools ───
 
   // task_send — fire-and-forget or track for later retrieval
@@ -919,6 +1029,15 @@ export default function extension(api: ExtensionAPI) {
       }
       const elapsed = Math.round((Date.now() - pending.createdAt) / 1000);
       return { content: [{ type: "text", text: `⏳ Pending... (${elapsed}s elapsed, target: ${pending.targetPeer})` }] };
+    },
+    renderCall(args: any, theme: any) {
+      return new Text(theme.fg("toolTitle", theme.bold("task_get ")) + theme.fg("dim", args.taskId?.slice(0, 12) ?? "?"), 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "⏳ Waiting..."), 0, 0);
+      const t = result.content?.[0]?.text ?? "";
+      const failed = t.includes("Unknown");
+      return new Text((failed ? theme.fg("dim", "○ ") : t.startsWith("✅") ? theme.fg("success", "✓ ") : theme.fg("warning", "⏳ ")) + t.replace(/^[✅⏳] /, "").slice(0, 100), 0, 0);
     },
   });
 
@@ -1043,6 +1162,19 @@ export default function extension(api: ExtensionAPI) {
           resolve({ content: [{ type: "text", text: `✅ Result from ${result.from}:\n${result.result}` }] });
         };
       });
+    },
+    renderCall(args: any, theme: any) {
+      const tgt = args.peer ?? "?";
+      const prompt = args.task ?? "";
+      const preview = prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt;
+      let text = theme.fg("toolTitle", theme.bold("remote_task ")) + theme.fg("accent", tgt);
+      if (preview) text += "\n  " + theme.fg("dim", preview);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "⏳ Waiting for response..."), 0, 0);
+      const t = result.content?.[0]?.text ?? "";
+      return new Text((t.startsWith("✅") ? theme.fg("success", "✓ ") : theme.fg("error", "✗ ")) + t.replace(/^[✅⏰❌] /, "").slice(0, 100), 0, 0);
     },
   });
 
@@ -1407,6 +1539,260 @@ export default function extension(api: ExtensionAPI) {
       return { content: [{ type: "text", text: formatAudit(entries) }] };
     },
   });
+
+  // ─── network_comm — Direct messaging with ask/reply/pending (ported from pi-intercom) ───
+  let replyWaiter: { from: string; replyTo: string; resolve: (msg: any) => void; reject: (err: Error) => void } | null = null;
+
+  function waitForReply(from: string, replyTo: string, signal?: AbortSignal): Promise<any> {
+    if (replyWaiter) return Promise.reject(new Error("Already waiting for a reply"));
+    if (signal?.aborted) return Promise.reject(new Error("Cancelled"));
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (replyWaiter?.replyTo === replyTo) replyWaiter = null;
+        reject(new Error(`No reply from "${from}" within 10 minutes`));
+      }, 10 * 60 * 1000);
+      const cleanup = () => { clearTimeout(timeout); signal?.removeEventListener("abort", onAbort); };
+      const onAbort = () => { cleanup(); reject(new Error("Cancelled")); };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      replyWaiter = { from, replyTo, resolve: (msg) => { cleanup(); resolve(msg); }, reject: (err) => { cleanup(); reject(err); } };
+    });
+  }
+
+  // Intercept broker messages to resolve reply waiters
+  const origHandler = handleBrokerInboundMessage;
+  handleBrokerInboundMessage = (ctx, from, message) => {
+    // Check if this is a reply we're waiting for
+    if (replyWaiter && message.replyTo) {
+      const senderTarget = from.name || from.id;
+      const fromMatches = senderTarget.toLowerCase() === replyWaiter.from.toLowerCase() || from.id === replyWaiter.from;
+      if (fromMatches && message.replyTo === replyWaiter.replyTo) {
+        replyWaiter.resolve({ from, message });
+        return;
+      }
+    }
+    origHandler(ctx, from, message);
+  };
+
+  pi.registerTool({
+    name: "network_comm",
+    label: "Network Communication",
+    description: "Direct messaging across the mesh. Actions: 'send' (fire-and-forget), 'ask' (send + wait for reply), 'reply' (auto-target current sender), 'pending' (show unresolved asks), 'status' (connection info). Use 'ask' when you need a response to continue, 'send' for fire-and-forget notifications, 'reply' when responding to an incoming message.",
+    promptSnippet: "Send message across mesh",
+    promptGuidelines: [
+      "Use network_comm action='ask' when you need a response to continue working.",
+      "Use network_comm action='send' for fire-and-forget notifications.",
+      "Use network_comm action='reply' when responding to an inbound message — it auto-targets the sender.",
+      "Use network_comm action='pending' to check for unresolved asks.",
+    ],
+    parameters: Type.Object({
+      action: StringEnum(["send", "ask", "reply", "pending", "status"], { description: "Communication action" }),
+      to: Type.Optional(Type.String({ description: "Target agent name (for send/ask, or to disambiguate reply)" })),
+      message: Type.Optional(Type.String({ description: "Message text" })),
+      attachments: Type.Optional(Type.Array(Type.Object({
+        type: StringEnum(["file", "snippet", "context"]),
+        name: Type.String(),
+        content: Type.String(),
+        language: Type.Optional(Type.String()),
+      })), { description: "Optional file/snippet/context attachments" }),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const { action, to, message, attachments } = params;
+
+      switch (action) {
+        case "status": {
+          const connected = brokerClient?.isConnected() ?? false;
+          const pending = replyTracker.listPending();
+          return {
+            content: [{ type: "text", text: `Connected: ${connected ? `Yes (${currentSessionId?.slice(0, 8)})` : "No"}\nPending asks: ${pending.length}${pending.length > 0 ? "\n" + pending.map(p => `  • ${p.from.name}: ${p.message.content.text.slice(0, 60)}...`).join("\n") : ""}` }],
+          };
+        }
+
+        case "pending": {
+          const pending = replyTracker.listPending();
+          if (pending.length === 0) {
+            return { content: [{ type: "text", text: "No pending asks" }] };
+          }
+          const lines = pending.map(p => {
+            const elapsed = Math.round((Date.now() - p.receivedAt) / 1000);
+            const preview = p.message.content.text.length > 60 ? p.message.content.text.slice(0, 57) + "..." : p.message.content.text;
+            return `• ${p.from.name || p.from.id.slice(0, 8)} (${elapsed}s ago): ${preview}`;
+          });
+          return { content: [{ type: "text", text: `Pending asks:\n${lines.join("\n")}` }] };
+        }
+
+        case "send": {
+          if (!to || !message) return { content: [{ type: "text", text: "❌ 'to' and 'message' required for send" }], isError: true };
+          let client: BrokerClient;
+          try { client = await ensureBrokerConnected("tool"); } catch (e: any) {
+            return { content: [{ type: "text", text: `❌ Not connected: ${e.message}` }], isError: true };
+          }
+          try {
+            const result = await client.send(to, { text: message, attachments });
+            appendAudit({ event: "comm_send", sender: config.localName, recipient: to, hops: 0 });
+            return {
+              content: [{ type: "text", text: result.delivered ? `✅ Delivered to ${to}` : `❌ Not delivered: ${result.reason}` }],
+              isError: !result.delivered,
+              details: { messageId: result.id, delivered: result.delivered, reason: result.reason },
+            };
+          } catch (e: any) {
+            return { content: [{ type: "text", text: `❌ Send failed: ${e.message}` }], isError: true };
+          }
+        }
+
+        case "ask": {
+          if (!to || !message) return { content: [{ type: "text", text: "❌ 'to' and 'message' required for ask" }], isError: true };
+          if (replyWaiter) return { content: [{ type: "text", text: "❌ Already waiting for a reply" }], isError: true };
+          let client: BrokerClient;
+          try { client = await ensureBrokerConnected("tool"); } catch (e: any) {
+            return { content: [{ type: "text", text: `❌ Not connected: ${e.message}` }], isError: true };
+          }
+          const questionId = randomUUID();
+          try {
+            const sendResult = await client.send(to, {
+              text: message, attachments, messageId: questionId, expectsReply: true,
+            });
+            if (!sendResult.delivered) {
+              return { content: [{ type: "text", text: `❌ Not delivered: ${sendResult.reason}` }], isError: true };
+            }
+            appendAudit({ event: "comm_ask", sender: config.localName, recipient: to, hops: 0 });
+            // Block until reply
+            const reply = await waitForReply(to, questionId, signal);
+            replyTracker.markReplied(questionId);
+            const replyText = reply.message.content.text;
+            const replyAttachments = reply.message.content.attachments?.length
+              ? reply.message.content.attachments.map((a: any) => `\n---\n📎 ${a.name}\n${a.content}`).join("")
+              : "";
+            return { content: [{ type: "text", text: `**Reply from ${reply.from.name || reply.from.id.slice(0, 8)}:**\n${replyText}${replyAttachments}` }] };
+          } catch (e: any) {
+            if (replyWaiter?.replyTo === questionId) replyWaiter = null;
+            return { content: [{ type: "text", text: `❌ Ask failed: ${e.message}` }], isError: true };
+          }
+        }
+
+        case "reply": {
+          if (!message) return { content: [{ type: "text", text: "❌ 'message' required for reply" }], isError: true };
+          let target: { to: string; replyTo: string };
+          try {
+            const ctx2 = replyTracker.resolveReplyTarget({ to });
+            target = { to: ctx2.from.name || ctx2.from.id, replyTo: ctx2.message.id };
+          } catch (e: any) {
+            return { content: [{ type: "text", text: `❌ ${e.message}` }], isError: true };
+          }
+          let client: BrokerClient;
+          try { client = await ensureBrokerConnected("tool"); } catch (e: any) {
+            return { content: [{ type: "text", text: `❌ Not connected: ${e.message}` }], isError: true };
+          }
+          try {
+            const result = await client.send(target.to, { text: message, replyTo: target.replyTo, attachments });
+            replyTracker.markReplied(target.replyTo);
+            appendAudit({ event: "comm_reply", sender: config.localName, recipient: target.to, hops: 0 });
+            return {
+              content: [{ type: "text", text: result.delivered ? `✅ Reply sent to ${target.to}` : `❌ Not delivered: ${result.reason}` }],
+              isError: !result.delivered,
+            };
+          } catch (e: any) {
+            return { content: [{ type: "text", text: `❌ Reply failed: ${e.message}` }], isError: true };
+          }
+        }
+
+        default:
+          return { content: [{ type: "text", text: `Unknown action: ${action}` }], isError: true };
+      }
+    },
+    renderCall(args: any, theme: any) {
+      const action = args.action || "send";
+      const tgt = args.to ?? "?";
+      const msg = args.message ?? "";
+      const preview = msg.length > 60 ? msg.slice(0, 57) + "..." : msg;
+      const color = action === "ask" ? "warning" : action === "reply" ? "success" : "accent";
+      let text = theme.fg("toolTitle", theme.bold("network_comm ")) + theme.fg(color, action) + " → " + theme.fg("accent", tgt);
+      if (preview) text += "\n  " + theme.fg("dim", preview);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, { isPartial }: any, theme: any) {
+      if (isPartial) return new Text(theme.fg("warning", "⏳ Waiting for reply..."), 0, 0);
+      const text = result.content?.[0]?.text ?? "";
+      const failed = result.isError || text.startsWith("❌");
+      return new Text((failed ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ")) + text.replace(/^[✅❌] /, "").slice(0, 120), 0, 0);
+    },
+  });
+
+  // ─── contact_supervisor — Subagent-to-supervisor escalation (requires pi-subagents env vars) ───
+  const orchestratorTarget = process.env.PI_SUBAGENT_ORCHESTRATOR_TARGET?.trim();
+  const subRunId = process.env.PI_SUBAGENT_RUN_ID?.trim();
+  const subAgent = process.env.PI_SUBAGENT_CHILD_AGENT?.trim();
+  const subIndex = process.env.PI_SUBAGENT_CHILD_INDEX?.trim();
+
+  if (orchestratorTarget && subRunId && subAgent && subIndex) {
+    pi.registerTool({
+      name: "contact_supervisor",
+      label: "Contact Supervisor",
+      description: "Subagent-only: contact the supervisor that delegated this task. Use 'need_decision' when blocked or uncertain (blocks until reply). Use 'progress_update' for meaningful plan-changing updates (fire-and-forget). Do not use for routine completion.",
+      promptSnippet: "Contact supervisor",
+      parameters: Type.Object({
+        reason: StringEnum(["need_decision", "progress_update"], { description: "Contact reason" }),
+        message: Type.String({ description: "Decision request or progress update" }),
+      }),
+      async execute(_id, params, signal, _onUpdate, ctx) {
+        const { reason, message } = params;
+        let client: BrokerClient;
+        try { client = await ensureBrokerConnected("tool"); } catch (e: any) {
+          return { content: [{ type: "text", text: `❌ Not connected: ${e.message}` }], isError: true };
+        }
+
+        const formattedMessage = [
+          reason === "need_decision" ? "Subagent needs a supervisor decision." : "Subagent progress update.",
+          `Run: ${subRunId}`,
+          `Agent: ${subAgent}`,
+          `Child index: ${subIndex}`,
+          "",
+          message,
+        ].join("\n");
+
+        if (reason === "progress_update") {
+          try {
+            const result = await client.send(orchestratorTarget, { text: formattedMessage });
+            return {
+              content: [{ type: "text", text: result.delivered ? `Progress update sent to supervisor ${orchestratorTarget}` : `Not delivered: ${result.reason}` }],
+              isError: !result.delivered,
+            };
+          } catch (e: any) {
+            return { content: [{ type: "text", text: `Failed: ${e.message}` }], isError: true };
+          }
+        }
+
+        // need_decision: block until reply
+        if (replyWaiter) return { content: [{ type: "text", text: "Already waiting for a reply" }], isError: true };
+        const questionId = randomUUID();
+        try {
+          const sendResult = await client.send(orchestratorTarget, { text: formattedMessage, messageId: questionId, expectsReply: true });
+          if (!sendResult.delivered) {
+            return { content: [{ type: "text", text: `Not delivered: ${sendResult.reason}` }], isError: true };
+          }
+          const reply = await waitForReply(orchestratorTarget, questionId, signal);
+          const replyText = reply.message.content.text;
+          return { content: [{ type: "text", text: `**Reply from supervisor:**\n${replyText}` }] };
+        } catch (e: any) {
+          if (replyWaiter?.replyTo === questionId) replyWaiter = null;
+          return { content: [{ type: "text", text: `Failed: ${e.message}` }], isError: true };
+        }
+      },
+      renderCall(args: any, theme: any) {
+        const reason = args.reason || "contact";
+        const preview = (args.message || "").slice(0, 80);
+        const color = reason === "need_decision" ? "warning" : "muted";
+        let text = theme.fg("toolTitle", theme.bold("contact_supervisor ")) + theme.fg(color, reason);
+        if (preview) text += "\n  " + theme.fg("dim", preview);
+        return new Text(text, 0, 0);
+      },
+      renderResult(result: any, { isPartial }: any, theme: any) {
+        if (isPartial) return new Text(theme.fg("warning", "⏳ Waiting for supervisor..."), 0, 0);
+        const t = result.content?.[0]?.text ?? "";
+        const failed = result.isError || t.startsWith("❌");
+        return new Text((failed ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ")) + t.replace(/^[✅❌] /, "").slice(0, 120), 0, 0);
+      },
+    });
+  }
 
   // git_sync — Git synchronization tool (worker: branch/commit/push, manager: fetch/merge/consolidate)
   pi.registerTool({

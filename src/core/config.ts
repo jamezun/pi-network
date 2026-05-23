@@ -70,7 +70,55 @@ export function loadConfig(): BridgeConfig {
     throw new Error(`Pi Network config not found at ${configPath}. Run: mkdir -p ~/.pi/agent/bridge && create config.json`);
   }
 
-  const raw = JSON.parse(readFileSync(configPath, "utf8"));
+  let raw: any;
+  try {
+    raw = JSON.parse(readFileSync(configPath, "utf8"));
+  } catch (e: any) {
+    throw new Error(`Invalid JSON in ${configPath}: ${e.message}`);
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`Config must be a JSON object in ${configPath}`);
+  }
+
+  // Validate critical fields
+  if (raw.localName !== undefined && typeof raw.localName !== "string") {
+    throw new Error(`"localName" must be a string`);
+  }
+  if (raw.localName && !/^[a-zA-Z0-9_-]+$/.test(raw.localName)) {
+    throw new Error(`"localName" must contain only alphanumeric, dash, underscore: ${raw.localName}`);
+  }
+  if (raw.role !== undefined && raw.role !== "manager" && raw.role !== "worker") {
+    throw new Error(`"role" must be "manager" or "worker", got: ${raw.role}`);
+  }
+  if (raw.bridgePort !== undefined && (typeof raw.bridgePort !== "number" || raw.bridgePort < 1 || raw.bridgePort > 65535)) {
+    throw new Error(`"bridgePort" must be a number 1-65535`);
+  }
+  if (raw.mode !== undefined && !["tailscale", "server", "hybrid", "local", "whatsapp"].includes(raw.mode)) {
+    throw new Error(`"mode" must be tailscale|server|hybrid|local|whatsapp, got: ${raw.mode}`);
+  }
+  if (raw.pollInterval !== undefined && typeof raw.pollInterval !== "number") {
+    throw new Error(`"pollInterval" must be a number`);
+  }
+  if (raw.maxHops !== undefined && (typeof raw.maxHops !== "number" || raw.maxHops < 1)) {
+    throw new Error(`"maxHops" must be a positive number`);
+  }
+  if (raw.capabilities !== undefined && !Array.isArray(raw.capabilities)) {
+    throw new Error(`"capabilities" must be an array`);
+  }
+  if (raw.peers !== undefined && (typeof raw.peers !== "object" || Array.isArray(raw.peers))) {
+    throw new Error(`"peers" must be an object`);
+  }
+  if (raw.server !== undefined && (typeof raw.server !== "object" || !raw.server.url)) {
+    throw new Error(`"server" must have a "url" field`);
+  }
+  // Duplicate session name detection warning
+  if (raw.peers) {
+    const names = Object.values(raw.peers).map((p: any) => p?.type).filter(Boolean);
+    const dupes = names.filter((n, i) => names.indexOf(n) !== i);
+    if (dupes.length > 0) {
+      console.warn(`⚠️ Duplicate peer types in config: ${[...new Set(dupes)].join(", ")}`);
+    }
+  }
 
   const config: BridgeConfig = {
     localName: raw.localName || "unknown",

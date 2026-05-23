@@ -46,6 +46,14 @@ export class BrokerClient extends EventEmitter {
   private pendingSends = new Map<string, { resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
   private pendingLists = new Map<string, { resolve: (s: SessionInfo[]) => void; reject: (e: Error) => void }>();
   private disconnecting = false;
+  private disconnectError: Error | null = null;
+
+  private failPending(error: Error): void {
+    for (const p of this.pendingSends.values()) p.reject(error);
+    this.pendingSends.clear();
+    for (const p of this.pendingLists.values()) p.reject(error);
+    this.pendingLists.clear();
+  }
 
   get sessionId(): string | null { return this._sessionId; }
 
@@ -84,11 +92,15 @@ export class BrokerClient extends EventEmitter {
       };
 
       const onClose = () => {
+        const disconnectError = this.disconnectError ?? new Error("Client disconnected");
+        this.disconnecting = false;
         cleanup();
+        this.failPending(disconnectError);
         this._sessionId = null;
         if (this.socket === socket) this.socket = null;
+        this.disconnectError = null;
         if (!settled) reject(new Error("Connection closed before registration"));
-        if (connected) this.emit("disconnected");
+        if (connected) this.emit("disconnected", disconnectError);
       };
 
       const onReaderError = (error: Error) => {
@@ -108,7 +120,7 @@ export class BrokerClient extends EventEmitter {
       };
 
       socket.on("data", reader);
-      socket.on("error", (err: Error) => { if (connected) this.emit("error", err); });
+      socket.on("error", (err: Error) => { if (connected) { this.disconnectError = err; this.emit("error", err); } });
       socket.on("close", onClose);
       this.once("_registered", onRegistered);
 
