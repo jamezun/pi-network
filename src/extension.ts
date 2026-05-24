@@ -405,6 +405,62 @@ function refreshAgentsFromBroker() {
       }
     }
 
+    // ─── Discover remote peers from config.peers ───
+    // Ping each configured remote peer's HTTP bridge and add as agent if alive
+    const configPeers = (config as any)?.peers;
+    if (configPeers && typeof configPeers === "object") {
+      const peerNames = Object.keys(configPeers);
+      const peerPings = peerNames.map(async (peerName: string) => {
+        const peerCfg = configPeers[peerName];
+        if (!peerCfg?.host) return null;
+        const port = peerCfg.bridgePort || config.bridgePort;
+        const url = `http://${peerCfg.host}:${port}/ping`;
+        try {
+          const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+          const data = await res.json();
+          if (data.pong) {
+            return {
+              name: peerName,
+              status: "online" as const,
+              rawStatus: "online",
+              role: "worker" as const,
+              runtime: "pi" as const,
+              capabilities: [] as string[],
+              specialties: [] as string[],
+              sessionName: data.name || peerName,
+              heartbeatAt: Date.now(),
+              staleCount: 0,
+              remote: true,
+              host: peerCfg.host,
+              bridgePort: port,
+            };
+          }
+        } catch {}
+        // Offline peer — still show as offline
+        return {
+          name: peerName,
+          status: "offline" as const,
+          rawStatus: "offline",
+          role: "worker" as const,
+          runtime: "pi" as const,
+          capabilities: [],
+          specialties: [],
+          sessionName: peerName,
+          heartbeatAt: 0,
+          staleCount: 0,
+          remote: true,
+          host: peerCfg.host,
+          bridgePort: peerCfg.bridgePort || config.bridgePort,
+        };
+      });
+      const remotePeers = (await Promise.all(peerPings)).filter(Boolean) as any[];
+      for (const rp of remotePeers) {
+        if (!agents.some(a => a.name.toLowerCase() === rp.name.toLowerCase())) {
+          agents.push(rp);
+        }
+      }
+    }
+
     const ctx = getLiveContext();
     if (ctx) {
       const onlineCount = agents.filter((a: any) => a.status !== "offline").length;
