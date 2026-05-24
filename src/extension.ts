@@ -378,6 +378,27 @@ function refreshAgentsFromBroker() {
 
     agents = [...dedupedPi, ...uniqueClaude];
 
+    // Add WhatsApp number as a synthetic peer (receive-only, no work)
+    const waCfg = (config as any)?.whatsapp;
+    if (waCfg?.enabled && waCfg?.allowedNumbers?.length > 0) {
+      const waNumber = waCfg.allowedNumbers[0];
+      // Don't add duplicate if somehow already present
+      if (!agents.some(a => a.name === `📱${waNumber}`)) {
+        agents.push({
+          name: `📱${waNumber}`,
+          role: "worker" as const,
+          status: "online" as const,
+          lastSeen: Date.now(),
+          capabilities: ["receive-message"],
+          specialties: [],
+          manages: [],
+          reportTo: null,
+          runtime: "whatsapp",
+          model: "WhatsApp",
+        } as any);
+      }
+    }
+
     const ctx = getLiveContext();
     if (ctx) {
       const onlineCount = agents.filter((a: any) => a.status !== "offline").length;
@@ -864,7 +885,7 @@ export default function extension(api: ExtensionAPI) {
             for (const agent of agents) {
               const dot = agent.status === "online" ? "\ud83d\udfe2" : agent.status === "busy" ? "\ud83d\udfe1" : "\ud83d\udd34";
               const color = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
-              const rt = (agent as any).runtime === "claude" ? theme.fg("dim", " [claude]") : (agent as any).runtime === "pi" ? theme.fg("dim", " [pi]") : "";
+              const rt = (agent as any).runtime === "claude" ? theme.fg("dim", " [claude]") : (agent as any).runtime === "pi" ? theme.fg("dim", " [pi]") : (agent as any).runtime === "whatsapp" ? theme.fg("dim", " [whatsapp]") : "";
               const model = agent.model ? theme.fg("dim", ` ${abbreviateModel(agent.model)}`) : "";
               lines.push(`  ${dot} ${color}${rt}${model}`);
             }
@@ -876,7 +897,7 @@ export default function extension(api: ExtensionAPI) {
           for (const agent of agents) {
             const dot = agent.status === "online" ? "\ud83d\udfe2" : agent.status === "busy" ? "\ud83d\udfe1" : "\ud83d\udd34";
             const name = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
-            const rt = (agent as any).runtime === "claude" ? theme.fg("dim", " [claude]") : (agent as any).runtime === "pi" ? theme.fg("dim", " [pi]") : "";
+            const rt = (agent as any).runtime === "claude" ? theme.fg("dim", " [claude]") : (agent as any).runtime === "pi" ? theme.fg("dim", " [pi]") : (agent as any).runtime === "whatsapp" ? theme.fg("dim", " [wa]") : "";
             const model = agent.model ? theme.fg("dim", ` ${abbreviateModel(agent.model)}`) : "";
             tokens.push(`${dot}${name}${rt}${model}`);
           }
@@ -1467,6 +1488,7 @@ export default function extension(api: ExtensionAPI) {
       const filter = params.filter || "online";
       const targets = agents.filter((a) => {
         if (a.name === config.localName) return false;
+        if ((a as any).runtime === "whatsapp") return false; // WhatsApp can't do tasks
         if (filter === "online") return a.status === "online" || a.status === "busy";
         if (filter === "all") return true;
         return a.capabilities.includes(filter);
@@ -2502,6 +2524,7 @@ export default function extension(api: ExtensionAPI) {
         const currentName = pi.getSessionName?.() || config.localName;
         const onlinePeers = agents.filter(a => 
           a.name !== currentName && a.name !== config.localName && 
+          (a as any).runtime !== "whatsapp" &&
           (a.status === "online" || a.status?.includes("idle") || a.status?.includes("online"))
         );
         if (onlinePeers.length === 0) {
@@ -2615,6 +2638,7 @@ export default function extension(api: ExtensionAPI) {
       const currentName = pi.getSessionName?.() || config.localName;
       const onlinePeers = agents.filter(a => 
         a.name !== currentName && a.name !== config.localName && 
+        (a as any).runtime !== "whatsapp" &&
         (a.status === "online" || a.status?.includes("idle") || a.status?.includes("online"))
       );
       if (onlinePeers.length === 0) {
