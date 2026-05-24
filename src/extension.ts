@@ -227,6 +227,8 @@ async function ensureBrokerConnected(reason: "startup" | "background" | "tool" |
       });
       if (!getLiveContext(ctx, gen)) { await nextClient.disconnect(); throw new Error("Runtime no longer active"); }
       reconnectAttempt = 0;
+      // Broker doesn't notify us about pre-existing sessions on connect, so fetch them now.
+      refreshAgentsFromBroker();
       return nextClient;
     } catch (e) {
       if (brokerClient === nextClient) brokerClient = null;
@@ -284,7 +286,9 @@ function refreshAgentsFromBroker() {
       .map(s => ({
         name: s.name || s.id.slice(0, 8),
         status: s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("\ud83d\udfe2") ? "online" : s.status?.includes("busy") || s.status?.includes("tool:") ? "busy" : "offline",
+        rawStatus: s.status,
         role: s.role,
+        runtime: s.runtime,
         capabilities: s.capabilities || [],
         specialties: s.specialties || [],
         model: s.model,
@@ -298,6 +302,11 @@ function refreshAgentsFromBroker() {
         project: s.project,
         startedAt: s.startedAt,
       }));
+    const ctx = getLiveContext();
+    if (ctx) {
+      const onlineCount = agents.filter(a => a.status !== "offline").length;
+      ctx.ui.setStatus("bridge", `\ud83c\udf10 ${mode.toUpperCase()} | ${onlineCount}/${Math.max(agents.length, 1)} peers`);
+    }
   }).catch(() => { agents = loadRegistry(); });
 }
 
@@ -771,13 +780,12 @@ export default function extension(api: ExtensionAPI) {
 
           // Show broker sessions (live, real names)
           if (brokerClient?.isConnected()) {
-            // Synchronously show last-known sessions from the heartbeat
             for (const agent of agents) {
-              if (agent.name === config.localName) continue;
-              const dot = agent.status === "online" || agent.status?.includes?.("online") || agent.status?.includes?.("idle") || agent.status?.startsWith?.("🟢") ? "🟢" : agent.status === "busy" || agent.status?.includes?.("busy") || agent.status?.includes?.("tool:") ? "🟡" : "🔴";
+              const dot = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : "🔴";
               const color = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
+              const rt = (agent as any).runtime === "claude" ? theme.fg("dim", " [claude]") : (agent as any).runtime === "pi" ? theme.fg("dim", " [pi]") : "";
               const model = agent.model ? theme.fg("dim", ` ${abbreviateModel(agent.model)}`) : "";
-              lines.push(`  ${dot} ${color}${model}`);
+              lines.push(`  ${dot} ${color}${rt}${model}`);
             }
           }
 
