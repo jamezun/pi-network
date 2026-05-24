@@ -615,9 +615,9 @@ function startPendingTasksCleanup() {
 
 function injectTask(envelope: TaskEnvelope) {
   activeEnvelopes.set(envelope.taskId, envelope);
-  const from = envelope.chain[envelope.chain.length - 1]?.agent || "unknown";
+  const from = (envelope.chain?.length ? envelope.chain[envelope.chain.length - 1]?.agent : null) || "unknown";
   const origin = `${envelope.originInstructor}/${envelope.originSession}`;
-  const chainStr = envelope.chain.map((h) => h.agent).join(" → ");
+  const chainStr = envelope.chain?.map((h) => h.agent).join(" → ") || "";
 
   pi.sendUserMessage(
     `[📱 Remote task from ${from}]\n` +
@@ -1037,7 +1037,7 @@ export default function extension(api: ExtensionAPI) {
         taskId: envelope.taskId, rootTaskId: envelope.rootTaskId,
         from: config.localName, fromSession: pi.getSessionName?.() || "unknown",
         deliverTo: envelope.deliverTo,
-        deliverToSession: envelope.chain.length > 0 ? envelope.chain[envelope.chain.length - 1].session : undefined,
+        deliverToSession: (envelope.chain?.length ?? 0) > 0 ? envelope.chain[envelope.chain.length - 1].session : undefined,
         result: validatedResult, files: [], chain: envelope.chain,
         originInstructor: envelope.originInstructor, originSession: envelope.originSession,
         needsConsolidation: envelope.requiresConsolidation,
@@ -1564,7 +1564,7 @@ export default function extension(api: ExtensionAPI) {
         return { content: [{ type: "text", text: `No active task ${params.taskId}` }] };
       }
 
-      const chainHead = envelope.chain.length > 0 ? envelope.chain[0] : null;
+      const chainHead = (envelope.chain?.length ?? 0) > 0 ? envelope.chain[0] : null;
       if (chainHead && chainHead.agent !== config.localName) {
         await transport.sendClarification(chainHead.agent, params.taskId, params.question);
         return { content: [{ type: "text", text: `💬 Sent clarification to ${chainHead.agent}. Waiting for answer...` }] };
@@ -1597,7 +1597,7 @@ export default function extension(api: ExtensionAPI) {
         taskId: envelope.taskId, rootTaskId: envelope.rootTaskId,
         from: config.localName, fromSession: pi.getSessionName?.() || "unknown",
         deliverTo: envelope.deliverTo,
-        deliverToSession: envelope.chain.length > 0 ? envelope.chain[envelope.chain.length - 1].session : undefined,
+        deliverToSession: (envelope.chain?.length ?? 0) > 0 ? envelope.chain[envelope.chain.length - 1].session : undefined,
         result: `Task returned: ${params.reason}`,
         files: [], chain: envelope.chain,
         originInstructor: envelope.originInstructor, originSession: envelope.originSession,
