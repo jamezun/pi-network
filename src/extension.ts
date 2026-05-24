@@ -320,7 +320,7 @@ function refreshAgentsFromBroker() {
     ? brokerClient.listSessions().then(s => { return s; }).catch((e: any) => { debugLog(`broker list error: ${e.message}`); return [] as any[]; })
     : Promise.resolve([] as any[]);
 
-  piSessionsPromise.then(async (piSessions) => {
+  piSessionsPromise.then((piSessions) => {
     const piAgents = piSessions
       .filter((s: any) => s.id !== currentSessionId)
       .filter((s: any) => s.status !== "external")  // Skip virtual/bridged Claude sessions (can't handle mesh tasks)
@@ -410,77 +410,87 @@ function refreshAgentsFromBroker() {
       }
     }
 
-    // ─── Discover remote peers from config.peers ───
-    // Ping each configured remote peer's HTTP bridge and add as agent if alive
-    const configPeers = (config as any)?.peers;
-    if (configPeers && typeof configPeers === "object") {
-      const peerNames = Object.keys(configPeers);
-      const peerPings = peerNames.map(async (peerName: string) => {
-        const peerCfg = configPeers[peerName];
-        if (!peerCfg?.host) return null;
-        const port = peerCfg.bridgePort || config.bridgePort;
-        const baseUrl = `http://${peerCfg.host}:${port}`;
-        try {
-          // Use /status for rich info (sessionName, model, status), fallback /ping
-          const res = await fetch(`${baseUrl}/status`, { signal: AbortSignal.timeout(3000) });
-          const data = await res.json();
-          const displayName = data.sessionName || data.name || peerName;
-          return {
-            name: displayName,
-            status: data.online ? "online" as const : "offline" as const,
-            rawStatus: data.status || "online",
-            role: "worker" as const,
-            runtime: "pi" as const,
-            capabilities: [] as string[],
-            specialties: [] as string[],
-            sessionName: displayName,
-            model: data.model,
-            cwd: data.cwd || "",
-            heartbeatAt: Date.now(),
-            staleCount: 0,
-            remote: true,
-            configName: peerName,
-            host: peerCfg.host,
-            bridgePort: port,
-          };
-        } catch {}
-        // Offline peer — show config name with offline status
-        return {
-          name: peerName,
-          status: "offline" as const,
-          rawStatus: "offline",
-          role: "worker" as const,
-          runtime: "pi" as const,
-          capabilities: [],
-          specialties: [],
-          sessionName: peerName,
-          heartbeatAt: 0,
-          staleCount: 0,
-          remote: true,
-          configName: peerName,
-          host: peerCfg.host,
-          bridgePort: peerCfg.bridgePort || config.bridgePort,
-        };
-      });
-      const remotePeers = (await Promise.all(peerPings)).filter(Boolean) as any[];
-      for (const rp of remotePeers) {
-        const existingIdx = agents.findIndex(a => (a as any).remote && ((a as any).configName || a.name).toLowerCase() === ((rp as any).configName || rp.name).toLowerCase());
-        if (existingIdx >= 0) {
-          // Update existing remote peer in-place (prevents flashing)
-          const old = agents[existingIdx];
-          Object.assign(old, rp);
-        } else if (!agents.some(a => a.name.toLowerCase() === rp.name.toLowerCase())) {
-          agents.push(rp);
-        }
-      }
-    }
-
     const ctx = getLiveContext();
     if (ctx) {
       const onlineCount = agents.filter((a: any) => a.status !== "offline").length;
       if (showPeersInFooter) ctx.ui.setStatus("bridge", `\ud83c\udf10 ${onlineCount}/${agents.length} peers online`);
     }
   }).catch(() => { debugLog("refreshAgentsFromBroker failed, keeping current agents"); });
+
+  // ─── Discover remote peers SEPARATELY (non-blocking) ───
+  refreshRemotePeers();
+}
+
+/** Ping remote peers from config and merge into agents array. Runs independently. */
+function refreshRemotePeers() {
+  const configPeers = (config as any)?.peers;
+  if (!configPeers || typeof configPeers !== "object") return;
+  const peerNames = Object.keys(configPeers);
+  if (peerNames.length === 0) return;
+
+  Promise.all(peerNames.map(async (peerName: string) => {
+    const peerCfg = configPeers[peerName];
+    if (!peerCfg?.host) return null;
+    const port = peerCfg.bridgePort || config.bridgePort;
+    const baseUrl = `http://${peerCfg.host}:${port}`;
+    try {
+      const res = await fetch(`${baseUrl}/status`, { signal: AbortSignal.timeout(3000) });
+      const data = await res.json();
+      const displayName = data.sessionName || data.name || peerName;
+      return {
+        name: displayName,
+        status: data.online ? "online" as const : "offline" as const,
+        rawStatus: data.status || "online",
+        role: "worker" as const,
+        runtime: "pi" as const,
+        capabilities: [] as string[],
+        specialties: [] as string[],
+        sessionName: displayName,
+        model: data.model,
+        cwd: data.cwd || "",
+        heartbeatAt: Date.now(),
+        staleCount: 0,
+        remote: true,
+        configName: peerName,
+        host: peerCfg.host,
+        bridgePort: port,
+      };
+    } catch {
+      return {
+        name: peerName,
+        status: "offline" as const,
+        rawStatus: "offline",
+        role: "worker" as const,
+        runtime: "pi" as const,
+        capabilities: [] as string[],
+        specialties: [] as string[],
+        sessionName: peerName,
+        heartbeatAt: 0,
+        staleCount: 0,
+        remote: true,
+        configName: peerName,
+        host: peerCfg.host,
+        bridgePort: peerCfg.bridgePort || config.bridgePort,
+      };
+    }
+  })).then((remotePeers) => {
+    const valid = remotePeers.filter(Boolean) as any[];
+    if (valid.length === 0) return;
+    for (const rp of valid) {
+      const existingIdx = agents.findIndex(a => (a as any).remote && ((a as any).configName || a.name).toLowerCase() === ((rp as any).configName || rp.name).toLowerCase());
+      if (existingIdx >= 0) {
+        Object.assign(agents[existingIdx], rp);
+      } else if (!agents.some(a => a.name.toLowerCase() === rp.name.toLowerCase())) {
+        agents.push(rp);
+      }
+    }
+    // Update footer count
+    const ctx = getLiveContext();
+    if (ctx) {
+      const onlineCount = agents.filter((a: any) => a.status !== "offline").length;
+      if (showPeersInFooter) ctx.ui.setStatus("bridge", `\ud83c\udf10 ${onlineCount}/${agents.length} peers online`);
+    }
+  }).catch(() => {});
 }
 
 function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: BrokerClient | null): boolean {
