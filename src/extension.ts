@@ -60,6 +60,10 @@ import { WhatsAppBridge } from "./whatsapp-bridge";
 import { NetworkInlineMessage, makeMessageDetails } from "./ui/inline-message";
 import { PeerListOverlay } from "./ui/session-list";
 import { NetworkComposeOverlay } from "./ui/compose";
+import { NetworkSettingsOverlay } from "./ui/network-settings";
+import type { NetworkSettings } from "./ui/network-settings";
+import { DEFAULT_SETTINGS } from "./ui/network-settings";
+import { loadNetworkSettings, saveNetworkSettings } from "./core/settings-sync";
 import type { PersonaDef } from "./core/personas";
 import { ulid } from "./core/ulid";
 import { GitSyncManager, loadGitSyncConfig } from "./core/git-sync";
@@ -292,6 +296,7 @@ function debugLog(msg: string) {
 }
 let showPeersInFooter = true;  // toggle with /network peers
 let peerLayout: "horizontal" | "vertical" = "horizontal";
+let networkSettings: NetworkSettings = loadNetworkSettings();
 let lastRefreshTime = 0;
 let refreshPending = false;
 function debouncedRefresh() {
@@ -1141,6 +1146,51 @@ export default function extension(api: ExtensionAPI) {
     const msgGen = runtimeGeneration;
     const live = getLiveContext(ctx, msgGen);
     if (!live) return;
+
+    // Handle network protocol messages (JSON-encoded)
+    try {
+      const parsed = JSON.parse(message.content?.text || "");
+      if (parsed.type === "network_task_available") {
+        // Auto-claim if this peer is in the autoClaimPeers list
+        if (networkSettings.autoClaimPeers.includes(config.localName) ||
+            networkSettings.autoClaimPeers.includes(pi.getSessionName?.() || "")) {
+          const { claimTask } = require("./core/task-claim");
+          const claimed = claimTask(parsed.taskId, config.localName);
+          if (claimed && brokerClient?.isConnected()) {
+            brokerClient.send(parsed.postedBy, {
+              text: JSON.stringify({ type: "network_task_claimed", taskId: parsed.taskId, claimedBy: config.localName }),
+              messageId: `claim-${parsed.taskId}`,
+            }).catch(() => {});
+            live.ui.notify(`✅ Auto-claimed task: ${parsed.taskId}\n${parsed.task.slice(0, 80)}`, "info");
+          }
+        }
+        return; // Don't display as regular message
+      }
+      if (parsed.type === "network_settings_update") {
+        // Merge remote settings (union of autoClaimPeers)
+        const remote = parsed.settings as NetworkSettings;
+        if (remote) {
+          networkSettings.enableTaskBoard = remote.enableTaskBoard;
+          // Union: add any new peers from remote, keep ours
+          for (const p of (remote.autoClaimPeers || [])) {
+            if (!networkSettings.autoClaimPeers.includes(p)) {
+              networkSettings.autoClaimPeers.push(p);
+            }
+          }
+          saveNetworkSettings(networkSettings);
+          live.ui.notify(`⚙️ Settings synced from ${from.name || from.id}`, "info");
+        }
+        return;
+      }
+      if (parsed.type === "network_task_claimed") {
+        // Someone claimed our task
+        const task = (await import("./core/task-claim")).getTask(parsed.taskId);
+        if (task) {
+          live.ui.notify(`✅ Task ${parsed.taskId} claimed by ${parsed.claimedBy}`, "info");
+        }
+        return;
+      }
+    } catch { /* not JSON, regular message */ }
 
     const turnCtx = replyTracker.recordIncomingMessage(from, message);
     replyTracker.queueTurnContext(turnCtx);
@@ -2411,6 +2461,70 @@ export default function extension(api: ExtensionAPI) {
     });
   }
 
+  // ─── Task claiming system ───
+  const { postTask, claimTask, getOpenTasks, getAllTasks, setOnNewTask } = await import("./core/task-claim");
+
+  // When a new task is posted, notify auto-claim peers
+  setOnNewTask((task) => {
+    if (!networkSettings.enableTaskBoard) return;
+    if (!brokerClient?.isConnected()) return;
+    // Broadcast task to all peers — only auto-claim enabled ones will grab it
+    brokerClient.send("all", {
+      text: JSON.stringify({ type: "network_task_available", taskId: task.taskId, task: task.task, priority: task.priority, postedBy: task.postedBy }),
+      messageId: `task-notify-${task.taskId}`,
+    }).catch(() => {});
+  });
+
+  pi.registerTool({
+    name: "post_task",
+    label: "Post Task to Network",
+    description: "Post a task to the network for any idle peer to grab. First to claim gets it.",
+    parameters: Type.Object({
+      task: Type.String({ description: "The task description" }),
+      priority: Type.Optional(StringEnum(["urgent", "high", "normal", "low"] as const, { description: "Priority level" })),
+    }),
+    async execute(_id, params) {
+      const taskId = `claim-${Date.now().toString(36)}`;
+      const t = postTask(taskId, params.task, config.localName, params.priority);
+      appendAudit({ event: "task_posted", sender: config.localName, taskId: t.taskId });
+      return { content: [{ type: "text", text: `📋 Task posted: ${taskId}\n${params.task}\n\nWaiting for peers to claim...\nUse /network tasks to check status.` }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "claim_task",
+    label: "Claim Open Task",
+    description: "Claim an open task from the network. First to claim gets it.",
+    parameters: Type.Object({
+      taskId: Type.String({ description: "The task ID to claim" }),
+    }),
+    async execute(_id, params) {
+      const t = claimTask(params.taskId, config.localName);
+      if (!t) return { content: [{ type: "text", text: `❌ Task ${params.taskId} not available (already claimed, expired, or not found)` }], isError: true };
+      appendAudit({ event: "task_claimed", sender: config.localName, taskId: t.taskId });
+      return { content: [{ type: "text", text: `✅ Claimed task: ${t.taskId}\n📋 ${t.task}\nPosted by: ${t.postedBy}` }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "list_tasks",
+    label: "List Network Tasks",
+    description: "List open tasks on the network available for claiming.",
+    parameters: Type.Object({
+      all: Type.Optional(Type.Boolean({ description: "Show all tasks (including claimed/completed)" })),
+    }),
+    async execute(_id, params) {
+      const list = params.all ? getAllTasks() : getOpenTasks();
+      if (list.length === 0) return { content: [{ type: "text", text: "No open tasks" }] };
+      const lines = list.map(t => {
+        const icon = t.status === "open" ? "🟢" : t.status === "claimed" ? "🟡" : t.status === "completed" ? "✅" : "⏰";
+        const age = Math.round((Date.now() - t.postedAt) / 1000);
+        return `${icon} ${t.taskId} [${t.priority}] (${age}s ago)\n   ${t.task.slice(0, 100)}${t.claimedBy ? `\n   Claimed by: ${t.claimedBy}` : ""}`;
+      });
+      return { content: [{ type: "text", text: `📋 Tasks (${list.length}):\n${lines.join("\n")}` }] };
+    },
+  });
+
   // ─── Slash commands ───
   pi.registerCommand("git-sync", {
     description: "Git sync: status/fetch/branches/merge/diff/consolidate. Manager-only: merge, consolidate.",
@@ -2574,7 +2688,84 @@ export default function extension(api: ExtensionAPI) {
         return;
       }
 
-            // /network send → pick peer and compose message
+            // /network tasks → list open tasks
+      if (subcommand === "tasks") {
+        const open = getOpenTasks();
+        if (open.length === 0) {
+          ctx.ui.notify("📋 No open tasks. Post one with post_task({ task: \"...\" })", "info");
+          return;
+        }
+        const lines = open.map(t => {
+          const age = Math.round((Date.now() - t.postedAt) / 1000);
+          return `📋 ${t.taskId} [${t.priority}] (${age}s ago)\n   ${t.task.slice(0, 100)}\n   Posted by: ${t.postedBy}`;
+        });
+        ctx.ui.notify(`📋 Open Tasks (${open.length}):\n${lines.join("\n")}`, "info");
+        return;
+      }
+
+      // /network grab → claim first open task
+      if (subcommand === "grab") {
+        const open = getOpenTasks();
+        if (open.length === 0) {
+          ctx.ui.notify("📋 No open tasks to grab", "warning");
+          return;
+        }
+        const t = claimTask(open[0].taskId, config.localName);
+        if (!t) {
+          ctx.ui.notify("❌ Task already claimed or expired", "warning");
+          return;
+        }
+        ctx.ui.notify(`✅ Claimed: ${t.taskId}\n📋 ${t.task.slice(0, 100)}`, "info");
+        return;
+      }
+
+      // /network post → post a task
+      if (subcommand === "post") {
+        const taskText = parts.slice(1).join(" ");
+        if (!taskText) {
+          ctx.ui.notify("Usage: /network post <task description>", "warning");
+          return;
+        }
+        const taskId = `claim-${Date.now().toString(36)}`;
+        postTask(taskId, taskText, config.localName);
+        ctx.ui.notify(`📋 Posted: ${taskId}\n${taskText}`, "info");
+        return;
+      }
+
+      // /network settings → toggle auto-claim peers
+      if (subcommand === "settings" || subcommand === "config") {
+        if (!ctx.hasUI) {
+          ctx.ui.notify("❌ /network settings requires interactive TUI", "warning");
+          return;
+        }
+        try {
+          const result = await ctx.ui.custom<{ settings: NetworkSettings; saved: boolean } | undefined>(
+            (_tui, theme, keybindings, done) =>
+              new NetworkSettingsOverlay(theme, keybindings, agents, networkSettings, done),
+            { overlay: true },
+          );
+          if (result?.saved) {
+            networkSettings = result.settings;
+            saveNetworkSettings(networkSettings);
+            // Sync settings to all peers via broker
+            if (brokerClient?.isConnected()) {
+              try {
+                await brokerClient.send("all", {
+                  text: JSON.stringify({ type: "network_settings_update", settings: networkSettings }),
+                  messageId: `settings-${Date.now()}`,
+                });
+              } catch {}
+            }
+            const claimList = networkSettings.autoClaimPeers.length > 0
+              ? networkSettings.autoClaimPeers.join(", ")
+              : "none";
+            ctx.ui.notify(`⚙️ Settings saved & synced\nTask Board: ${networkSettings.enableTaskBoard ? "ON" : "OFF"}\nAuto-claim: ${claimList}`, "info");
+          }
+        } catch {}
+        return;
+      }
+
+      // /network send → pick peer and compose message
       if (subcommand === "send") {
         if (!ctx.hasUI) {
           ctx.ui.notify("❌ /network send requires interactive TUI", "warning");

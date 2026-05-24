@@ -160,6 +160,18 @@ export class WhatsAppBridge {
         case "help":
           await this.handleHelp(msg.from);
           break;
+        case "tasks":
+          await this.handleTasks(msg.from);
+          break;
+        case "grab":
+          await this.handleGrab(msg.from);
+          break;
+        case "post":
+          await this.handlePost(msg.from, parsed.task || "");
+          break;
+        case "settings":
+          await this.sendReply(msg.from, `⚙️ Settings available in TUI: /network settings`);
+          break;
         default:
           await this.sendReply(msg.from, formatParseError());
       }
@@ -292,6 +304,46 @@ export class WhatsAppBridge {
       await this.meshTransport.sendKill(agent.name, taskId).catch(() => {});
     }
     await this.sendReply(from, `🔪 Kill signal sent for ${taskId}`);
+  }
+
+  private async handleTasks(from: string): Promise<void> {
+    const { getOpenTasks } = require("./core/task-claim");
+    const open = getOpenTasks();
+    if (open.length === 0) {
+      await this.sendReply(from, "📋 No open tasks. Post one with /post <task>");
+      return;
+    }
+    const lines = open.map(t => {
+      const age = Math.round((Date.now() - t.postedAt) / 1000);
+      return `📋 ${t.taskId} [${t.priority}] (${age}s)\n   ${t.task.slice(0, 80)}\n   By: ${t.postedBy}`;
+    });
+    await this.sendReply(from, `*Open Tasks (${open.length}):*\n\n${lines.join("\n\n")}`);
+  }
+
+  private async handleGrab(from: string): Promise<void> {
+    const { getOpenTasks, claimTask } = require("./core/task-claim");
+    const open = getOpenTasks();
+    if (open.length === 0) {
+      await this.sendReply(from, "❌ No open tasks to grab");
+      return;
+    }
+    const t = claimTask(open[0].taskId, `wa:${from}`);
+    if (!t) {
+      await this.sendReply(from, "❌ Task already claimed or expired");
+      return;
+    }
+    await this.sendReply(from, `✅ Claimed: ${t.taskId}\n📋 ${t.task.slice(0, 100)}\nPosted by: ${t.postedBy}`);
+  }
+
+  private async handlePost(from: string, task: string): Promise<void> {
+    if (!task) {
+      await this.sendReply(from, "Usage: /post <task description>");
+      return;
+    }
+    const { postTask } = require("./core/task-claim");
+    const taskId = `claim-${Date.now().toString(36)}`;
+    postTask(taskId, task, `wa:${from}`);
+    await this.sendReply(from, `📋 Task posted: ${taskId}\n${task}\n\nWaiting for peers to claim...`);
   }
 
   private async handleHelp(from: string): Promise<void> {

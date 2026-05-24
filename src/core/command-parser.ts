@@ -3,7 +3,7 @@
 // Supports strict commands, fuzzy peer matching, and natural language fallback.
 
 export interface ParsedCommand {
-  type: "task" | "broadcast" | "status" | "peers" | "help" | "kill" | "history" | "unknown";
+  type: "task" | "broadcast" | "status" | "peers" | "help" | "kill" | "history" | "tasks" | "grab" | "post" | "unknown";
   peer?: string;
   task?: string;
   options?: {
@@ -132,8 +132,20 @@ export function parseCommand(input: string, prefix = "/", peers: string[] = know
   if (command === "kill" || command === "cancel") {
     return { type: "kill", taskId: rest || undefined, raw: input };
   }
-  if (command === "history" || command === "tasks") {
+  if (command === "history" || command === "tasks" || command === "list") {
     return { type: "history", raw: input };
+  }
+  if (command === "grab" || command === "claim") {
+    return { type: "grab", raw: input };
+  }
+  if (command === "post" || command === "request") {
+    const flags = parseFlags(rest);
+    return {
+      type: "post",
+      task: stripFlags(rest),
+      options: flags,
+      raw: input,
+    };
   }
   if (command === "broadcast" || command === "all") {
     const flags = parseFlags(rest);
@@ -222,6 +234,8 @@ export function formatHelpText(): string {
 /${"{"}peer${"}"} <task> — Send task (fuzzy match)
 /ask <peer> <task> — Explicit ask syntax
 /broadcast <task> — Send to all online peers
+/post <task> — Post task for anyone to claim
+/grab — Claim the first open task
 /status — Show network status
 /peers — List all peers
 /history — Recent task history
