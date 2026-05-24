@@ -51,6 +51,9 @@ export interface BridgeConfig {
   explicit?: boolean;          // Hide from auto-discovery if true
   vaultKey?: string;
   userId?: string;
+  whatsapp?: any;          // WhatsApp bridge config (passed through)
+  git_sync?: any;          // Git sync config (passed through)
+  [key: string]: any;      // Allow any additional fields
 }
 
 const BRIDGE_DIR = ".pi/agent/bridge";
@@ -121,6 +124,7 @@ export function loadConfig(): BridgeConfig {
   }
 
   const config: BridgeConfig = {
+    ...raw,
     localName: raw.localName || "unknown",
     bridgePort: raw.bridgePort || 9764,
     role: raw.role || undefined,

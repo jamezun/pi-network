@@ -806,12 +806,15 @@ export default function extension(api: ExtensionAPI) {
     // ─── Phase 2.4: WhatsApp bridge ───
     try {
       const waCfg = (config as any).whatsapp;
+      debugLog(`whatsapp config: enabled=${waCfg?.enabled}, url=${waCfg?.evolutionApiUrl}`);
       if (waCfg?.enabled) {
         whatsappBridge = new WhatsAppBridge(config, transport);
         await whatsappBridge.start();
         ctx.ui.notify("📱 WhatsApp bridge started", "info");
+        debugLog("whatsapp bridge started successfully");
       }
     } catch (e: any) {
+      debugLog(`whatsapp bridge FAILED: ${e.message}`);
       ctx.ui.notify(`⚠️ WhatsApp bridge failed: ${e.message}`, "warning");
       whatsappBridge = null;
     }
