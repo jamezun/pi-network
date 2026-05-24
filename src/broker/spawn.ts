@@ -101,8 +101,8 @@ export async function spawnBrokerIfNeeded(brokerCommand = "npx", brokerArgs = ["
     if (await isBrokerRunning()) return;
 
     // Resolve broker path relative to this file
-    // At runtime, compiled output is in dist/ so use .js extension
-    const brokerPath = join(__dirname, "broker.js");
+    // Extensions loaded by pi run from source (.ts), not compiled (.js)
+    const brokerPath = join(__dirname, "broker.ts");
 
     const child = spawn(brokerCommand, [...brokerArgs, brokerPath], {
       detached: true,

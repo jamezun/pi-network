@@ -443,6 +443,14 @@ function startLocalBridge(port: number) {
     res.writeHead(404);
     res.end(JSON.stringify({ error: "Not found" }));
   });
+  bridgeServer.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      console.warn(`[pi-network] Port ${port} already in use — another session is the manager. Running as client.`);
+      bridgeServer = null;
+    } else {
+      console.error(`[pi-network] Bridge server error:`, err);
+    }
+  });
   bridgeServer.listen(port, "127.0.0.1", () => {});
 }
 
@@ -2432,7 +2440,7 @@ export default function extension(api: ExtensionAPI) {
   });
 
   // ─── Keyboard shortcut ───
-  pi.registerShortcut("alt+m", {
+  pi.registerShortcut("alt+n", {
     description: "Open network compose (send message to mesh peer)",
     handler: async (ctx) => {
       agents = loadRegistry();
