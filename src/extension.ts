@@ -108,6 +108,7 @@ interface PendingTask {
   timer: ReturnType<typeof setTimeout> | null;
 }
 const pendingTasks: Map<string, PendingTask> = new Map();
+const notifiedSessions = new Set<string>(); // Track which sessions we've already announced
 
 let bridgeServer: any;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -277,7 +278,11 @@ function attachBrokerClientHandlers(client: BrokerClient): void {
     const ctx = getLiveContext();
     if (!ctx) return;
     const label = session.name || shortSessionId(session.id);
-    notifyIfLive(ctx, `🟢 ${label} joined the mesh`, "info");
+    // Only notify once per session ID (suppress reconnect/re-register spam)
+    if (!notifiedSessions.has(session.id)) {
+      notifiedSessions.add(session.id);
+      notifyIfLive(ctx, `🟢 ${label} joined the mesh`, "info");
+    }
     debouncedRefresh();
   });
   client.on("session_left", (sessionId) => {
