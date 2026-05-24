@@ -247,6 +247,11 @@ async function ensureBrokerConnected(reason: "startup" | "background" | "tool" |
 }
 
 function attachBrokerClientHandlers(client: BrokerClient): void {
+  // Catch unhandled socket errors (ECONNRESET etc.) to prevent crash
+  client.on("error", (err: Error) => {
+    debugLog(`brokerClient error: ${err.message}`);
+    // Don't reconnect here — "disconnected" event handles that
+  });
   client.on("message", (from, message) => {
     const live = getLiveContext();
     if (brokerClient !== client || !live) return;
