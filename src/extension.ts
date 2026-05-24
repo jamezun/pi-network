@@ -589,7 +589,7 @@ function startLocalBridge(port: number) {
       console.error(`[pi-network] Bridge server error:`, err);
     }
   });
-  bridgeServer.listen(port, "127.0.0.1", () => {});
+  bridgeServer.listen(port, "0.0.0.0", () => {});
 }
 
 function stopLocalBridge() { bridgeServer?.close(); }
