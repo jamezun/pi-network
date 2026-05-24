@@ -283,7 +283,7 @@ function refreshAgentsFromBroker() {
       .filter(s => s.id !== currentSessionId)
       .map(s => ({
         name: s.name || s.id.slice(0, 8),
-        status: s.status?.includes?("online") || s.status?.includes?("idle") || s.status?.startsWith?("\ud83d\udfe2") ? "online" : s.status?.includes?("busy") || s.status?.includes?("tool:") ? "busy" : "offline",
+        status: s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("\ud83d\udfe2") ? "online" : s.status?.includes("busy") || s.status?.includes("tool:") ? "busy" : "offline",
         role: s.role,
         capabilities: s.capabilities || [],
         specialties: s.specialties || [],
@@ -1437,7 +1437,7 @@ export default function extension(api: ExtensionAPI) {
         const others = brokerSessions.filter(s => s.id !== currentSessionId);
         if (others.length === 0) lines.push("No other sessions online.");
         for (const s of others) {
-          const icon = (s.status?.includes?("online") || s.status?.includes?("idle") || s.status?.startsWith?("🟢")) ? "🟢" : (s.status?.includes?("busy") || s.status?.includes?("tool:")) ? "🟡" : "🔴";
+          const icon = (s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("🟢")) ? "🟢" : (s.status?.includes("busy") || s.status?.includes("tool:")) ? "🟡" : "🔴";
           const rt = s.runtime === "claude" ? "claude" : s.runtime === "pi" ? "pi" : "?";
           const model = s.model || "?";
           const shortModel = model.replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
@@ -2220,10 +2220,9 @@ export default function extension(api: ExtensionAPI) {
   }
 
   // ─── Slash commands ───
-  pi.registerCommand({
-    name: "git-sync",
+  pi.registerCommand("git-sync", {
     description: "Git sync: status/fetch/branches/merge/diff/consolidate. Manager-only: merge, consolidate.",
-    async execute(args, ctx) {
+    async handler(args, ctx) {
       const parts = (args || "").trim().split(/\s+/);
       const subcommand = parts[0] || "status";
       const target = parts[1];
@@ -2327,10 +2326,9 @@ export default function extension(api: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand({
-    name: "network",
-    description: "Network operations: status, send (compose message to peer), manage peers. Flags: --all, --project=NAME, --prune",
-    async execute(args, ctx) {
+  pi.registerCommand("network", {
+    description: "Network operations: status, send (compose message to peer), manage peers.",
+    async handler(args, ctx) {
       const parts = (args || "").trim().split(/\s+/);
       const subcommand = parts[0] || "status";
 
@@ -2346,7 +2344,7 @@ export default function extension(api: ExtensionAPI) {
         if (others.length > 0) {
           status += `\nPeers:\n`;
           for (const s of others) {
-            const icon = (s.status?.includes?("online") || s.status?.includes?("idle") || s.status?.startsWith?("🟢")) ? "🟢" : (s.status?.includes?("busy") || s.status?.includes?("tool:")) ? "🟡" : "🔴";
+            const icon = (s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("🟢")) ? "🟢" : (s.status?.includes("busy") || s.status?.includes("tool:")) ? "🟡" : "🔴";
             const rt = s.runtime === "claude" ? "claude" : s.runtime === "pi" ? "pi" : "?";
             const model = (s.model || "?").replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
             status += `${icon} ${s.name || s.id.slice(0, 8)} [${rt}] ${model}\n`;
