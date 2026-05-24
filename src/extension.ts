@@ -1411,9 +1411,11 @@ export default function extension(api: ExtensionAPI) {
         for (const s of others) {
           const icon = s.status === "online" || s.status === "idle" ? "🟢" : s.status === "busy" ? "🟡" : "🔴";
           const rt = s.runtime === "claude" ? "claude" : s.runtime === "pi" ? "pi" : "?";
+          const model = s.model || "?";
+          const shortModel = model.replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
           const caps = s.capabilities?.length ? s.capabilities.join(", ") : "";
           const ctx = s.contextUsedPct != null ? ` ${buildCtxBar(s.contextUsedPct, null)}` : "";
-          lines.push(`${icon} **${s.name || s.id.slice(0, 8)}** [${rt}]${caps ? ` — ${caps}` : ""}${ctx}`);
+          lines.push(`${icon} **${s.name || s.id.slice(0, 8)}** [${rt}] ${shortModel}${caps ? ` — ${caps}` : ""}${ctx}`);
         }
       } else {
         // Fall back to file-based registry
@@ -1741,7 +1743,7 @@ export default function extension(api: ExtensionAPI) {
               `Connected: ${connected ? `Yes (${currentSessionId?.slice(0, 8)})` : "No"}\n` +
               `Session: ${pi.getSessionName?.() || config.localName}\n` +
               `Runtime: ${detectRuntime()}\n` +
-              `Peers: ${others.length > 0 ? others.map(s => s.name || s.id.slice(0, 8)).join(", ") : "none"}\n` +
+              `Peers: ${others.length > 0 ? others.map(s => { const rt = s.runtime || "?"; const m = (s.model || "?").replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, ""); return `${s.name || s.id.slice(0, 8)} [${rt}] ${m}`; }).join(", ") : "none"}\n` +
               `Pending asks: ${pending.length}${pending.length > 0 ? "\n" + pending.map(p => `  • ${p.from.name}: ${p.message.content.text.slice(0, 60)}...`).join("\n") : ""}`
             }],
           };
@@ -2318,7 +2320,8 @@ export default function extension(api: ExtensionAPI) {
           for (const s of others) {
             const icon = s.status === "online" || s.status === "idle" ? "🟢" : s.status === "busy" ? "🟡" : "🔴";
             const rt = s.runtime === "claude" ? "claude" : s.runtime === "pi" ? "pi" : "?";
-            status += `${icon} ${s.name || s.id.slice(0, 8)} [${rt}]\n`;
+            const model = (s.model || "?").replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
+            status += `${icon} ${s.name || s.id.slice(0, 8)} [${rt}] ${model}\n`;
           }
         } else {
           status += `No other sessions.\n`;

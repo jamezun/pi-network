@@ -1,5 +1,5 @@
 // Pi Network — Broker spawn logic (auto-start broker if not running)
-// Ported from pi-intercom's spawn.ts with path adjustments for pi-network.
+// Resolves tsx from local node_modules or falls back to pi-intercom's tsx.
 
 import { spawn } from "child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
@@ -83,10 +83,26 @@ async function waitForBroker(timeoutMs = 5000): Promise<void> {
 }
 
 /**
- * Spawn the broker process if it's not already running.
- * Uses PID file + socket connectivity check. On Windows, uses a VBS hidden launcher.
+ * Find tsx CLI path — check local node_modules, then pi-intercom's node_modules.
  */
-export async function spawnBrokerIfNeeded(brokerCommand = "npx", brokerArgs = ["--no-install", "tsx"]): Promise<void> {
+function resolveTsxPath(): string | null {
+  const candidates = [
+    // Local node_modules
+    join(__dirname, "..", "..", "node_modules", "tsx", "dist", "cli.mjs"),
+    // pi-intercom's node_modules (common co-install)
+    join(require("os").homedir(), ".pi", "agent", "extensions", "pi-intercom", "node_modules", "tsx", "dist", "cli.mjs"),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+/**
+ * Spawn the broker process if it's not already running.
+ * Resolves tsx from local or pi-intercom's node_modules.
+ */
+export async function spawnBrokerIfNeeded(): Promise<void> {
   mkdirSync(BROKER_DIR, { recursive: true });
 
   if (await isBrokerRunning()) return;
@@ -100,17 +116,24 @@ export async function spawnBrokerIfNeeded(brokerCommand = "npx", brokerArgs = ["
   try {
     if (await isBrokerRunning()) return;
 
-    // Resolve broker path relative to this file
-    // Extensions loaded by pi run from source (.ts), not compiled (.js)
     const brokerPath = join(__dirname, "broker.ts");
+    const tsxPath = resolveTsxPath();
 
-    const child = spawn(brokerCommand, [...brokerArgs, brokerPath], {
-      detached: true,
-      stdio: "ignore",
-      cwd: dirname(brokerPath),
-      env: { ...process.env, NODE_NO_WARNINGS: "1" },
-      windowsHide: true,
-    });
+    const child = tsxPath
+      ? spawn(process.execPath, [tsxPath, brokerPath], {
+          detached: true,
+          stdio: "ignore",
+          cwd: dirname(brokerPath),
+          env: { ...process.env, NODE_NO_WARNINGS: "1" },
+          windowsHide: true,
+        })
+      : spawn("npx", ["--no-install", "tsx", brokerPath], {
+          detached: true,
+          stdio: "ignore",
+          cwd: dirname(brokerPath),
+          env: { ...process.env, NODE_NO_WARNINGS: "1" },
+          windowsHide: true,
+        });
     child.unref();
 
     await new Promise<void>((resolve, reject) => {
