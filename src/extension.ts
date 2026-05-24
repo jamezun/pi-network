@@ -264,17 +264,43 @@ function attachBrokerClientHandlers(client: BrokerClient): void {
     if (!ctx) return;
     const label = session.name || shortSessionId(session.id);
     notifyIfLive(ctx, `🟢 ${label} joined the mesh`, "info");
-    agents = loadRegistry();
+    refreshAgentsFromBroker();
   });
   client.on("session_left", (sessionId) => {
-    agents = loadRegistry();
+    refreshAgentsFromBroker();
   });
   client.on("presence_update", (session) => {
-    agents = loadRegistry();
+    refreshAgentsFromBroker();
   });
 }
 
 // Check if target matches current session (local self-delivery)
+// Refresh agents array from broker sessions (async, fire-and-forget)
+function refreshAgentsFromBroker() {
+  if (!brokerClient?.isConnected()) { agents = loadRegistry(); return; }
+  brokerClient.listSessions().then(sessions => {
+    agents = sessions
+      .filter(s => s.id !== currentSessionId)
+      .map(s => ({
+        name: s.name || s.id.slice(0, 8),
+        status: s.status?.includes?("online") || s.status?.includes?("idle") || s.status?.startsWith?("\ud83d\udfe2") ? "online" : s.status?.includes?("busy") || s.status?.includes?("tool:") ? "busy" : "offline",
+        role: s.role,
+        capabilities: s.capabilities || [],
+        specialties: s.specialties || [],
+        model: s.model,
+        pid: s.pid,
+        sessionName: s.name,
+        cwd: s.cwd || "",
+        heartbeatAt: s.lastActivity,
+        staleCount: 0,
+        contextUsedPct: (s as any).contextUsedPct,
+        color: s.color,
+        project: s.project,
+        startedAt: s.startedAt,
+      }));
+  }).catch(() => { agents = loadRegistry(); });
+}
+
 function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: BrokerClient | null): boolean {
   const targets = new Set<string>();
   const add = (t: string | null | undefined) => { const v = t?.trim(); if (v) targets.add(v.toLowerCase()); };
@@ -733,28 +759,30 @@ export default function extension(api: ExtensionAPI) {
     });
 
     const onlineCount = agents.filter((a) => a.status !== "offline" && a.name !== config.localName).length;
-    ctx.ui.setStatus("bridge", `🌐 ${mode.toUpperCase()} | ${onlineCount}/${Object.keys(config.peers).length} peers`);
+    ctx.ui.setStatus("bridge", `🌐 ${mode.toUpperCase()} | ${onlineCount}/${Math.max(Object.keys(config.peers).length, 1)} peers`);
 
     // ─── Pool Widget ───
     ctx.ui.setWidget("pi-network-pool", (_tui: any, theme: any) => {
       return {
         render(width: number) {
-          if (agents.length === 0) {
-            return [theme.fg("dim", `  🌐 No peers (${mode.toUpperCase()} | project: ${config.project})`)];
-          }
-
           const lines: string[] = [];
           const header = `  🌐 ${mode.toUpperCase()} | project: ${config.project}`;
           lines.push(theme.fg("dim", header));
 
-          for (const agent of agents) {
-            if (agent.name === config.localName) continue;
-            const dot = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : agent.status === "unresponsive" ? "🟠" : "🔴";
-            const color = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
-            const model = agent.model ? theme.fg("dim", ` ${abbreviateModel(agent.model)}`) : "";
-            const ctxPct = agent.contextUsedPct != null ? ` ${buildCtxBar(agent.contextUsedPct, theme)}` : "";
-            const stale = (agent.staleCount || 0) >= 3 ? theme.fg("error", " stale") : "";
-            lines.push(`  ${dot} ${color}${model}${ctxPct}${stale}`);
+          // Show broker sessions (live, real names)
+          if (brokerClient?.isConnected()) {
+            // Synchronously show last-known sessions from the heartbeat
+            for (const agent of agents) {
+              if (agent.name === config.localName) continue;
+              const dot = agent.status === "online" || agent.status?.includes?.("online") || agent.status?.includes?.("idle") || agent.status?.startsWith?.("🟢") ? "🟢" : agent.status === "busy" || agent.status?.includes?.("busy") || agent.status?.includes?.("tool:") ? "🟡" : "🔴";
+              const color = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
+              const model = agent.model ? theme.fg("dim", ` ${abbreviateModel(agent.model)}`) : "";
+              lines.push(`  ${dot} ${color}${model}`);
+            }
+          }
+
+          if (lines.length <= 1) {
+            lines.push(theme.fg("dim", "  No peers discovered yet"));
           }
 
           return lines;
@@ -1409,7 +1437,7 @@ export default function extension(api: ExtensionAPI) {
         const others = brokerSessions.filter(s => s.id !== currentSessionId);
         if (others.length === 0) lines.push("No other sessions online.");
         for (const s of others) {
-          const icon = s.status === "online" || s.status === "idle" ? "🟢" : s.status === "busy" ? "🟡" : "🔴";
+          const icon = (s.status?.includes?("online") || s.status?.includes?("idle") || s.status?.startsWith?("🟢")) ? "🟢" : (s.status?.includes?("busy") || s.status?.includes?("tool:")) ? "🟡" : "🔴";
           const rt = s.runtime === "claude" ? "claude" : s.runtime === "pi" ? "pi" : "?";
           const model = s.model || "?";
           const shortModel = model.replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
@@ -2318,7 +2346,7 @@ export default function extension(api: ExtensionAPI) {
         if (others.length > 0) {
           status += `\nPeers:\n`;
           for (const s of others) {
-            const icon = s.status === "online" || s.status === "idle" ? "🟢" : s.status === "busy" ? "🟡" : "🔴";
+            const icon = (s.status?.includes?("online") || s.status?.includes?("idle") || s.status?.startsWith?("🟢")) ? "🟢" : (s.status?.includes?("busy") || s.status?.includes?("tool:")) ? "🟡" : "🔴";
             const rt = s.runtime === "claude" ? "claude" : s.runtime === "pi" ? "pi" : "?";
             const model = (s.model || "?").replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
             status += `${icon} ${s.name || s.id.slice(0, 8)} [${rt}] ${model}\n`;
