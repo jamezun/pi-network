@@ -1840,6 +1840,40 @@ export default function extension(api: ExtensionAPI) {
     },
   });
 
+  // ─── WhatsApp outbound routing ───
+  function isWhatsAppTarget(target: string): boolean {
+    const waAgents = agents.filter(a => (a as any).runtime === "whatsapp");
+    return waAgents.some(a => a.name === target || a.name.includes(target));
+  }
+
+  function extractWhatsAppNumber(target: string): string {
+    // Extract number from "📱+852-97319997" → "85297319997"
+    const match = target.match(/\d+/g);
+    return match ? match.join("") : target.replace(/[^0-9]/g, "");
+  }
+
+  async function sendToWhatsApp(target: string, text: string, files?: Array<{name: string, content: string}>): Promise<{content: Array<{type: string, text: string}>}> {
+    if (!whatsappBridge) {
+      return { content: [{ type: "text", text: "❌ WhatsApp bridge not running" }] };
+    }
+    const number = extractWhatsAppNumber(target);
+    try {
+      // Send text
+      await (whatsappBridge as any).sendReply(number, text);
+      // Send files if any
+      if (files) {
+        for (const file of files) {
+          await whatsappBridge.sendFile(number, file.content, file.name, "application/octet-stream");
+        }
+      }
+      appendAudit({ event: "comm_send_whatsapp", sender: config.localName, recipient: target, hops: 0 });
+      pi.appendEntry?.("network_sent", { to: target, message: text.slice(0, 200), timestamp: Date.now() });
+      return { content: [{ type: "text", text: `✅ Sent to ${target} via WhatsApp` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `❌ WhatsApp send failed: ${e.message}` }], isError: true };
+    }
+  }
+
   // ─── network_comm — Direct messaging with ask/reply/pending (ported from pi-intercom) ───
   let replyWaiter: { from: string; replyTo: string; resolve: (msg: any) => void; reject: (err: Error) => void } | null = null;
 
@@ -1926,6 +1960,11 @@ export default function extension(api: ExtensionAPI) {
 
         case "send": {
           if (!to || !message) return { content: [{ type: "text", text: "❌ 'to' and 'message' required for send" }], isError: true };
+          // WhatsApp routing
+          if (isWhatsAppTarget(to)) {
+            const files = attachments?.map(a => ({ name: a.name, content: a.content }));
+            return await sendToWhatsApp(to, message, files);
+          }
           let client: BrokerClient;
           try { client = await ensureBrokerConnected("tool"); } catch (e: any) {
             return { content: [{ type: "text", text: `❌ Not connected: ${e.message}` }], isError: true };
@@ -1946,6 +1985,12 @@ export default function extension(api: ExtensionAPI) {
 
         case "ask": {
           if (!to || !message) return { content: [{ type: "text", text: "❌ 'to' and 'message' required for ask" }], isError: true };
+          // WhatsApp: send but can't await reply from a phone user
+          if (isWhatsAppTarget(to)) {
+            const files = attachments?.map(a => ({ name: a.name, content: a.content }));
+            const result = await sendToWhatsApp(to, "❓ " + message, files);
+            return { content: [{ type: "text", text: result.content[0].text + "\n⚠️ WhatsApp replies are not routable back — use /help on WhatsApp to trigger commands" }] };
+          }
           if (replyWaiter) return { content: [{ type: "text", text: "❌ Already waiting for a reply" }], isError: true };
           let client: BrokerClient;
           try { client = await ensureBrokerConnected("tool"); } catch (e: any) {
@@ -1977,6 +2022,11 @@ export default function extension(api: ExtensionAPI) {
 
         case "reply": {
           if (!message) return { content: [{ type: "text", text: "❌ 'message' required for reply" }], isError: true };
+          // WhatsApp reply
+          if (to && isWhatsAppTarget(to)) {
+            const files = attachments?.map(a => ({ name: a.name, content: a.content }));
+            return await sendToWhatsApp(to, message, files);
+          }
           let target: { to: string; replyTo: string };
           try {
             const ctx2 = replyTracker.resolveReplyTarget({ to });
