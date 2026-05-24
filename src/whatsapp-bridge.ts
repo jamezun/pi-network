@@ -6,7 +6,7 @@ import type { BridgeConfig } from "./core/config";
 import type { Transport } from "./transport/index";
 import type { WhatsAppTransport } from "./transport/whatsapp";
 import type { TaskEnvelope, TaskResult } from "./core/tasks";
-import { formatHelpText } from "./core/command-parser";
+import { formatHelpText, fuzzyMatchPeer } from "./core/command-parser";
 import type { ParsedCommand } from "./core/command-parser";
 import { WhatsAppSecurity } from "./core/whatsapp-security";
 import { WhatsAppNotifier } from "./core/whatsapp-notify";
@@ -73,19 +73,38 @@ export class WhatsAppBridge {
     this.waTransport.onMessage((msg) => this.handleInboundMessage(msg));
     await this.waTransport.start();
 
+    // Feed known peers to the parser for fuzzy matching
+    const agents = loadRegistry();
+    this.waTransport.setPeers(agents.map(a => a.name));
+    // Refresh peers periodically
+    this.peerRefreshInterval = setInterval(() => {
+      const a = loadRegistry();
+      if (this.waTransport) this.waTransport.setPeers(a.map(ag => ag.name));
+    }, 30000);
+
     console.log("WhatsApp bridge started");
   }
 
   async stop(): Promise<void> {
     this.running = false;
+    if (this.peerRefreshInterval) { clearInterval(this.peerRefreshInterval); this.peerRefreshInterval = null; }
     if (this.waTransport) {
       await this.waTransport.stop();
       this.waTransport = null;
     }
   }
 
+  private peerRefreshInterval: ReturnType<typeof setInterval> | null = null;
+
   private async handleInboundMessage(msg: any): Promise<void> {
     console.log(`WhatsAppBridge.handleInboundMessage: type=${msg.type} from=${msg.from}`);
+
+    // Handle media messages
+    if (msg.type === "whatsapp-media") {
+      await this.handleMedia(msg);
+      return;
+    }
+
     if (msg.type !== "whatsapp-command") return;
 
     // Security check
@@ -145,7 +164,9 @@ export class WhatsAppBridge {
     }
 
     const agents = loadRegistry();
-    const peer = agents.find(a => a.name.toLowerCase() === parsed.peer?.toLowerCase());
+    const matched = fuzzyMatchPeer(parsed.peer, agents.map(a => a.name));
+    const peer = matched ? agents.find(a => a.name === matched) : null;
+    this.knownPeers = agents.map(a => a.name);
     if (!peer) {
       await this.sendReply(from, formatUnknownPeer(parsed.peer, agents.map(a => a.name)));
       return;
@@ -263,6 +284,26 @@ export class WhatsAppBridge {
     await this.sendReply(from, formatHelpText());
   }
 
+  private async handleMedia(msg: any): Promise<void> {
+    const { from, media, parsed, raw } = msg;
+    if (!media) return;
+
+    // If there's a parsed command with a peer, forward the media as part of a task
+    if (parsed?.peer && parsed?.task) {
+      const desc = `📎 File: ${media.fileName || media.type}${media.caption ? "\nCaption: " + media.caption : ""}\n\n${parsed.task}`;
+      // Create task with file reference
+      await this.handleTask(from, from, { ...parsed, task: desc });
+      return;
+    }
+
+    // Media without command — acknowledge and describe
+    const fileType = media.type;
+    const fileName = media.fileName || `${fileType} file`;
+    await this.sendReply(from, `📎 Received ${fileType}: _${fileName}_${media.caption ? "\nCaption: " + media.caption : ""}\n\n_To process, send with a command like:\n/${this.knownPeers[0] || "peer"} analyze this ${fileType}`);
+  }
+
+  private knownPeers: string[] = [];
+
   private async sendReply(from: string, text: string): Promise<void> {
     console.log(`WhatsAppBridge.sendReply: to=${from} text=${text.substring(0, 50)}`);
     // Route through WhatsApp transport
@@ -294,5 +335,26 @@ export class WhatsAppBridge {
     const formatted = formatTaskResult(result);
     await this.sendReply(result.originSession || this.waConfig.allowedNumbers[0], formatted);
     await this.notifier.notifyTaskComplete(result);
+  }
+
+  /**
+   * Send a file (docx, xls, pdf, md, etc.) to a WhatsApp number.
+   */
+  async sendFile(to: string, data: Buffer | string, fileName: string, mimeType: string, caption?: string): Promise<void> {
+    const base64 = typeof data === "string" ? data : data.toString("base64");
+    try {
+      await fetch(`${this.waConfig.evolutionApiUrl}/message/sendDocument/${this.waConfig.instanceName}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", apikey: this.waConfig.evolutionApiKey },
+        body: JSON.stringify({
+          number: to,
+          document: base64,
+          fileName: fileName || "file",
+          caption: caption || fileName || "",
+        }),
+      });
+    } catch (e: any) {
+      console.error(`WhatsApp sendFile error: ${e.message}`);
+    }
   }
 }
