@@ -210,6 +210,8 @@ async function ensureBrokerConnected(reason: "startup" | "background" | "tool" |
   if (reconnectPromise && reconnectPromiseGeneration === gen) return reconnectPromise;
 
   const nextPromise = (async (): Promise<BrokerClient> => {
+    // Disconnect any stale broker client first
+    if (brokerClient?.isConnected()) { try { await brokerClient.disconnect(); } catch {} brokerClient = null; }
     const nextClient = new BrokerClient();
     brokerClient = nextClient;
     attachBrokerClientHandlers(nextClient);
@@ -267,13 +269,13 @@ function attachBrokerClientHandlers(client: BrokerClient): void {
     if (!ctx) return;
     const label = session.name || shortSessionId(session.id);
     notifyIfLive(ctx, `🟢 ${label} joined the mesh`, "info");
-    refreshAgentsFromBroker();
+    debouncedRefresh();
   });
   client.on("session_left", (sessionId) => {
-    refreshAgentsFromBroker();
+    debouncedRefresh();
   });
   client.on("presence_update", (session) => {
-    refreshAgentsFromBroker();
+    debouncedRefresh();
   });
 }
 
@@ -283,11 +285,23 @@ const DEBUG_LOG = require("os").homedir() + "/.pi/agent/intercom/pi-network-debu
 function debugLog(msg: string) {
   try { require("fs").appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
 }
+let showPeersInFooter = true;  // toggle with /network peers
+let lastRefreshTime = 0;
+let refreshPending = false;
+function debouncedRefresh() {
+  const now = Date.now();
+  if (now - lastRefreshTime < 3000) {
+    if (!refreshPending) { refreshPending = true; setTimeout(() => { refreshPending = false; refreshAgentsFromBroker(); }, 3000 - (now - lastRefreshTime)); }
+    return;
+  }
+  lastRefreshTime = now;
+  refreshAgentsFromBroker();
+}
 
 function refreshAgentsFromBroker() {
-  debugLog(`refreshAgentsFromBroker: brokerClient=${brokerClient ? "exists" : "null"} isConnected=${brokerClient?.isConnected?.()}`);
+  // refreshAgentsFromBroker called
   const piSessionsPromise = brokerClient?.isConnected()
-    ? brokerClient.listSessions().then(s => { debugLog(`broker returned ${s.length} sessions`); return s; }).catch((e: any) => { debugLog(`broker list error: ${e.message}`); return [] as any[]; })
+    ? brokerClient.listSessions().then(s => { return s; }).catch((e: any) => { debugLog(`broker list error: ${e.message}`); return [] as any[]; })
     : Promise.resolve([] as any[]);
 
   piSessionsPromise.then(piSessions => {
@@ -315,7 +329,7 @@ function refreshAgentsFromBroker() {
 
     // Merge Claude sessions (discovered from ~/.claude/sessions/)
     const claudeSessions = discoverClaudeSessions();
-    debugLog(`claude discovery: ${claudeSessions.length} sessions, piAgents: ${piAgents.length}`);
+    // merged claude + broker sessions
     const claudeAgents = claudeSessions.map(s => ({
       name: s.name,
       status: s.status === "idle" ? "online" : s.status === "busy" ? "busy" : "online",
@@ -332,16 +346,25 @@ function refreshAgentsFromBroker() {
       startedAt: s.startedAt,
     }));
 
+    // Dedupe broker sessions: same name from different session IDs (stale registrations)
+    const seen = new Set<string>();
+    const dedupedPi = piAgents.filter((a: any) => {
+      const key = a.name.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
     // Dedupe: Claude sessions may already be in broker if claude-bridge is running
-    const piNames = new Set(piAgents.map((a: any) => a.name.toLowerCase()));
+    const piNames = new Set(dedupedPi.map((a: any) => a.name.toLowerCase()));
     const uniqueClaude = claudeAgents.filter((a: any) => !piNames.has(a.name.toLowerCase()));
 
-    agents = [...piAgents, ...uniqueClaude];
+    agents = [...dedupedPi, ...uniqueClaude];
 
     const ctx = getLiveContext();
     if (ctx) {
       const onlineCount = agents.filter((a: any) => a.status !== "offline").length;
-      ctx.ui.setStatus("bridge", `\ud83c\udf10 ${onlineCount}/${agents.length} peers online`);
+      if (showPeersInFooter) ctx.ui.setStatus("bridge", `\ud83c\udf10 ${onlineCount}/${agents.length} peers online`);
     }
   }).catch(() => { debugLog("refreshAgentsFromBroker failed, keeping current agents"); });
 }
@@ -548,8 +571,8 @@ function startHeartbeat() {
         pUpdate.agent = config.localName;
         brokerClient.updatePresence({ status: presenceManager.formatState() });
       }
-      // Refresh agents from broker (not file registry)
-      refreshAgentsFromBroker();
+      // Refresh agents from broker (debounced)
+      debouncedRefresh();
     } catch {}
   }, 30_000);
   try { (heartbeatTimer as any).unref?.(); } catch {}
@@ -814,6 +837,7 @@ export default function extension(api: ExtensionAPI) {
       return {
         render(width: number) {
           const lines: string[] = [];
+          if (!showPeersInFooter) return { render: () => [] as string[] }; // hidden
           const header = `  🌐 Pi Network`;
           lines.push(theme.fg("dim", header));
 
@@ -2405,6 +2429,18 @@ export default function extension(api: ExtensionAPI) {
           status += `No other sessions.\n`;
         }
         ctx.ui.notify(status, "info");
+        return;
+      }
+
+      // /network peers → toggle peer display in footer
+      if (subcommand === "peers") {
+        showPeersInFooter = !showPeersInFooter;
+        if (!showPeersInFooter) {
+          ctx.ui.setStatus("bridge", undefined as any);
+        } else {
+          refreshAgentsFromBroker();
+        }
+        ctx.ui.notify(`🌐 Peer display: ${showPeersInFooter ? "ON" : "OFF"}`, "info");
         return;
       }
 
