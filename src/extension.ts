@@ -395,7 +395,7 @@ function refreshAgentsFromBroker() {
           manages: [],
           reportTo: null,
           runtime: "whatsapp",
-          model: "WhatsApp",
+          model: undefined,
         } as any);
       }
     }
@@ -898,7 +898,7 @@ export default function extension(api: ExtensionAPI) {
           for (const agent of agents) {
             const dot = agent.status === "online" ? "\ud83d\udfe2" : agent.status === "busy" ? "\ud83d\udfe1" : "\ud83d\udd34";
             const name = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
-            const rt = (agent as any).runtime === "claude" ? theme.fg("dim", " [claude]") : (agent as any).runtime === "pi" ? theme.fg("dim", " [pi]") : (agent as any).runtime === "whatsapp" ? theme.fg("dim", " [wa]") : "";
+            const rt = (agent as any).runtime === "claude" ? theme.fg("dim", " [claude]") : (agent as any).runtime === "pi" ? theme.fg("dim", " [pi]") : (agent as any).runtime === "whatsapp" ? theme.fg("dim", " [whatsapp]") : "";
             const model = agent.model ? theme.fg("dim", ` ${abbreviateModel(agent.model)}`) : "";
             tokens.push(`${dot}${name}${rt}${model}`);
           }
