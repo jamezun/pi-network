@@ -315,7 +315,7 @@ function refreshAgentsFromBroker() {
     ? brokerClient.listSessions().then(s => { return s; }).catch((e: any) => { debugLog(`broker list error: ${e.message}`); return [] as any[]; })
     : Promise.resolve([] as any[]);
 
-  piSessionsPromise.then(piSessions => {
+  piSessionsPromise.then(async (piSessions) => {
     const piAgents = piSessions
       .filter((s: any) => s.id !== currentSessionId)
       .filter((s: any) => s.status !== "external")  // Skip virtual/bridged Claude sessions (can't handle mesh tasks)
