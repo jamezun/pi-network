@@ -837,7 +837,7 @@ export default function extension(api: ExtensionAPI) {
       return {
         render(width: number) {
           const lines: string[] = [];
-          if (!showPeersInFooter) return { render: () => [] as string[] }; // hidden
+          if (!showPeersInFooter) return { render: () => [""] }; // hidden
           const header = `  🌐 Pi Network`;
           lines.push(theme.fg("dim", header));
 
