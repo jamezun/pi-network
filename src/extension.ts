@@ -836,12 +836,11 @@ export default function extension(api: ExtensionAPI) {
     ctx.ui.setWidget("pi-network-pool", (_tui: any, theme: any) => {
       return {
         render(width: number) {
-          const lines: string[] = [];
-          if (!showPeersInFooter) return [""]; // hidden
-          const header = `  🌐 Pi Network`;
-          lines.push(theme.fg("dim", header));
+          if (!showPeersInFooter) return [""];
+          if (agents.length === 0) return [theme.fg("dim", "  🌐 Discovering peers...")];
 
-          if (agents.length > 0) {
+          if (peerLayout === "vertical") {
+            const lines: string[] = [theme.fg("dim", "  🌐 Pi Network")];
             for (const agent of agents) {
               const dot = agent.status === "online" ? "\ud83d\udfe2" : agent.status === "busy" ? "\ud83d\udfe1" : "\ud83d\udd34";
               const color = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
@@ -849,14 +848,37 @@ export default function extension(api: ExtensionAPI) {
               const model = agent.model ? theme.fg("dim", ` ${abbreviateModel(agent.model)}`) : "";
               lines.push(`  ${dot} ${color}${rt}${model}`);
             }
-          } else {
-            lines.push(theme.fg("dim", "  Discovering peers..."));
+            return lines;
           }
 
+          // Horizontal: peers inline, wrap at terminal width
+          const tokens: string[] = [];
+          for (const agent of agents) {
+            const dot = agent.status === "online" ? "\ud83d\udfe2" : agent.status === "busy" ? "\ud83d\udfe1" : "\ud83d\udd34";
+            const name = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
+            const rt = (agent as any).runtime === "claude" ? theme.fg("dim", "[c]") : (agent as any).runtime === "pi" ? theme.fg("dim", "[p]") : "";
+            tokens.push(`${dot}${name}${rt}`);
+          }
+          const prefix = "  \ud83c\udf10 ";
+          const sep = "  ";
+          const lines: string[] = [];
+          let currentLine = prefix;
+          for (let i = 0; i < tokens.length; i++) {
+            const candidate = currentLine + (i > 0 ? sep : "") + tokens[i];
+            const plain = candidate.replace(/\x1b\[[0-9;]*m/g, "");
+            if (plain.length > width && currentLine !== prefix) {
+              lines.push(currentLine);
+              currentLine = prefix + tokens[i];
+            } else {
+              currentLine = candidate;
+            }
+          }
+          if (currentLine.trim()) lines.push(currentLine);
           return lines;
         },
       };
     });
+
 
     // ─── Phase 1.8: Presence status widget ───
     // presence status intentionally not shown in footer
@@ -2432,15 +2454,21 @@ export default function extension(api: ExtensionAPI) {
         return;
       }
 
-      // /network peers → toggle peer display in footer
+      // /network peers → toggle peer display and layout
       if (subcommand === "peers") {
-        showPeersInFooter = !showPeersInFooter;
-        if (!showPeersInFooter) {
-          ctx.ui.setStatus("bridge", undefined as any);
+        const mode = parts[1];
+        if (mode === "horizontal" || mode === "h") {
+          peerLayout = "horizontal"; showPeersInFooter = true;
+          ctx.ui.notify("🌐 Peers: horizontal", "info");
+        } else if (mode === "vertical" || mode === "v") {
+          peerLayout = "vertical"; showPeersInFooter = true;
+          ctx.ui.notify("🌐 Peers: vertical", "info");
         } else {
-          refreshAgentsFromBroker();
+          showPeersInFooter = !showPeersInFooter;
+          if (!showPeersInFooter) ctx.ui.setStatus("bridge", undefined as any);
+          else refreshAgentsFromBroker();
+          ctx.ui.notify("🌐 Peers: " + (showPeersInFooter ? peerLayout : "OFF"), "info");
         }
-        ctx.ui.notify(`🌐 Peer display: ${showPeersInFooter ? "ON" : "OFF"}`, "info");
         return;
       }
 
