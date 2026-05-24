@@ -205,6 +205,13 @@ export function getPeerUrl(peerName: string, config: BridgeConfig): string {
   const peer = config.peers[peerName];
   if (!peer) throw new Error(`Unknown peer: ${peerName}`);
   const port = peer.bridgePort || config.bridgePort;
-  // Tailscale: use MagicDNS name
+  // Use explicit host if configured, otherwise try Tailscale DNS match, fall back to peerName
+  if ((peer as any).host) return `http://${(peer as any).host}:${port}`;
+  const tailnetPeers = getTailnetPeers();
+  for (const [tsName, info] of tailnetPeers) {
+    if (tsName.toLowerCase().includes(peerName.toLowerCase()) || peerName.toLowerCase().includes(tsName.toLowerCase())) {
+      return `http://${info.ip}:${port}`;
+    }
+  }
   return `http://${peerName}:${port}`;
 }
