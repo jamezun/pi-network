@@ -184,6 +184,7 @@ export class WhatsAppTransport implements Transport {
       type: "whatsapp-command",
       from: number,
       jid,
+      messageId: msg.key?.id || jid,
       parsed,
       timestamp: msg.messageTimestamp * 1000,
       raw: text,

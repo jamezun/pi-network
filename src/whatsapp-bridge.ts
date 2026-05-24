@@ -94,7 +94,7 @@ export class WhatsAppBridge {
     // Security check
     const securityResult = this.security.checkMessage({
       from: msg.from,
-      messageId: msg.jid,
+      messageId: msg.messageId || msg.jid,
       timestamp: msg.timestamp,
     });
 
