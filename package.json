@@ -13,6 +13,9 @@
     "@mariozechner/pi-coding-agent": ">=1.0.0",
     "@mariozechner/pi-ai": ">=1.0.0"
   },
+  "pi": {
+    "extensions": ["./src/extension.ts"]
+  },
   "keywords": [
     "pi",
     "coding-agent",
