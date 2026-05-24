@@ -459,7 +459,12 @@ function refreshAgentsFromBroker() {
       });
       const remotePeers = (await Promise.all(peerPings)).filter(Boolean) as any[];
       for (const rp of remotePeers) {
-        if (!agents.some(a => a.name.toLowerCase() === rp.name.toLowerCase())) {
+        const existingIdx = agents.findIndex(a => (a as any).remote && ((a as any).configName || a.name).toLowerCase() === ((rp as any).configName || rp.name).toLowerCase());
+        if (existingIdx >= 0) {
+          // Update existing remote peer in-place (prevents flashing)
+          const old = agents[existingIdx];
+          Object.assign(old, rp);
+        } else if (!agents.some(a => a.name.toLowerCase() === rp.name.toLowerCase())) {
           agents.push(rp);
         }
       }
@@ -541,6 +546,7 @@ function startLocalBridge(port: number) {
         activeTaskCount: concurrency.getRunningCount(),
         maxConcurrentTasks: config.maxConcurrentTasks,
         contextUsedPct: localEntry?.contextUsedPct ?? 0,
+        model: currentModel,
         color: config.color,
         purpose: config.purpose,
       }));
