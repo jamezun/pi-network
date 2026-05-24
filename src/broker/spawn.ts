@@ -1,5 +1,6 @@
-// Pi Network — Broker spawn logic (auto-start broker if not running)
-// Resolves tsx from local node_modules or falls back to pi-intercom's tsx.
+// Pi Network — Broker spawn logic
+// Reuses pi-intercom's broker when available, since both share the same socket.
+// Only spawns its own broker as a fallback.
 
 import { spawn } from "child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
@@ -20,10 +21,6 @@ function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-function isBrokerRunning(): Promise<boolean> {
-  return checkSocketConnectable();
-}
-
 function checkSocketConnectable(): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = net.connect(BROKER_SOCKET);
@@ -39,6 +36,23 @@ function checkSocketConnectable(): Promise<boolean> {
     socket.on("error", onError);
     const timeout = setTimeout(() => { socket.destroy(); finish(false); }, 1000);
   });
+}
+
+/** Check if a broker is running by socket first, then PID file (handles pi-intercom's broker). */
+async function isBrokerRunning(): Promise<boolean> {
+  // Fast path: socket is connectable (works for both pi-intercom and pi-network brokers)
+  if (await checkSocketConnectable()) return true;
+
+  // Check PID file — pi-intercom may have written it
+  if (!existsSync(BROKER_PID)) return false;
+  try {
+    const pid = parseInt(readFileSync(BROKER_PID, "utf-8").trim(), 10);
+    if (!Number.isFinite(pid)) return false;
+    process.kill(pid, 0);
+    return checkSocketConnectable();
+  } catch {
+    return false;
+  }
 }
 
 function acquireSpawnLock(): boolean {
@@ -82,15 +96,12 @@ async function waitForBroker(timeoutMs = 5000): Promise<void> {
   throw new Error("Broker failed to start within timeout");
 }
 
-/**
- * Find tsx CLI path — check local node_modules, then pi-intercom's node_modules.
- */
 function resolveTsxPath(): string | null {
   const candidates = [
+    // pi-intercom's node_modules (preferred — avoids duplicate tsx installs)
+    join(require("os").homedir(), ".pi", "agent", "extensions", "pi-intercom", "node_modules", "tsx", "dist", "cli.mjs"),
     // Local node_modules
     join(__dirname, "..", "..", "node_modules", "tsx", "dist", "cli.mjs"),
-    // pi-intercom's node_modules (common co-install)
-    join(require("os").homedir(), ".pi", "agent", "extensions", "pi-intercom", "node_modules", "tsx", "dist", "cli.mjs"),
   ];
   for (const p of candidates) {
     if (existsSync(p)) return p;
@@ -99,21 +110,27 @@ function resolveTsxPath(): string | null {
 }
 
 /**
- * Spawn the broker process if it's not already running.
- * Resolves tsx from local or pi-intercom's node_modules.
+ * Spawn the broker if not already running.
+ *
+ * Since pi-network and pi-intercom share the same socket path (~/.pi/agent/intercom/broker.sock),
+ * this will transparently reuse pi-intercom's broker if it's already running.
+ * Only spawns a new broker as a fallback.
  */
 export async function spawnBrokerIfNeeded(): Promise<void> {
   mkdirSync(BROKER_DIR, { recursive: true });
 
+  // Reuse existing broker (started by pi-intercom or a previous pi-network session)
   if (await isBrokerRunning()) return;
 
   const ownsLock = acquireSpawnLock();
   if (!ownsLock) {
+    // Another process is spawning the broker right now — wait for it
     await waitForBroker();
     return;
   }
 
   try {
+    // Double-check after acquiring lock
     if (await isBrokerRunning()) return;
 
     const brokerPath = join(__dirname, "broker.ts");

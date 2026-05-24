@@ -286,6 +286,7 @@ function debugLog(msg: string) {
   try { require("fs").appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
 }
 let showPeersInFooter = true;  // toggle with /network peers
+let peerLayout: "horizontal" | "vertical" = "horizontal";
 let lastRefreshTime = 0;
 let refreshPending = false;
 function debouncedRefresh() {
@@ -856,8 +857,9 @@ export default function extension(api: ExtensionAPI) {
           for (const agent of agents) {
             const dot = agent.status === "online" ? "\ud83d\udfe2" : agent.status === "busy" ? "\ud83d\udfe1" : "\ud83d\udd34";
             const name = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
-            const rt = (agent as any).runtime === "claude" ? theme.fg("dim", "[c]") : (agent as any).runtime === "pi" ? theme.fg("dim", "[p]") : "";
-            tokens.push(`${dot}${name}${rt}`);
+            const rt = (agent as any).runtime === "claude" ? theme.fg("dim", " [claude]") : (agent as any).runtime === "pi" ? theme.fg("dim", " [pi]") : "";
+            const model = agent.model ? theme.fg("dim", ` ${abbreviateModel(agent.model)}`) : "";
+            tokens.push(`${dot}${name}${rt}${model}`);
           }
           const prefix = "  \ud83c\udf10 ";
           const sep = "  ";
