@@ -382,10 +382,11 @@ function refreshAgentsFromBroker() {
     const waCfg = (config as any)?.whatsapp;
     if (waCfg?.enabled && waCfg?.allowedNumbers?.length > 0) {
       const waNumber = waCfg.allowedNumbers[0];
+      const formatted = `+${waNumber.slice(0,3)}-${waNumber.slice(3)}`;
       // Don't add duplicate if somehow already present
-      if (!agents.some(a => a.name === `📱${waNumber}`)) {
+      if (!agents.some(a => a.name === `📱${formatted}`)) {
         agents.push({
-          name: `📱${waNumber}`,
+          name: `📱${formatted}`,
           role: "worker" as const,
           status: "online" as const,
           lastSeen: Date.now(),
