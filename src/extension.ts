@@ -2227,6 +2227,23 @@ export default function extension(api: ExtensionAPI) {
     }
 
     pi.registerTool({
+      name: "intercom",
+      label: "Intercom (alias for network_comm)",
+      description: "Alias for network_comm. Used by pi-subagents for orchestration. Prefer network_comm directly.",
+      parameters: Type.Object({
+        action: StringEnum(["send", "ask", "reply", "pending", "status"], { description: "Communication action" }),
+        to: Type.Optional(Type.String({ description: "Target agent name" })),
+        message: Type.Optional(Type.String({ description: "Message text" })),
+      }),
+      async execute(_id, params, signal, onUpdate, ctx) {
+        // Delegate to network_comm execute
+        const ncTool = pi.getTool?.("network_comm");
+        if (ncTool?.execute) return ncTool.execute(_id, params, signal, onUpdate, ctx);
+        return { content: [{ type: "text", text: "❌ network_comm not available" }], isError: true };
+      },
+    });
+
+    pi.registerTool({
       name: "contact_supervisor",
       label: "Contact Supervisor",
       description: "Subagent-only: contact the supervisor. Use 'need_decision' when blocked (blocks until reply). Use 'interview_request' for structured Q&A (blocks until reply). Use 'progress_update' for plan-changing updates (fire-and-forget). Do not use for routine completion.",
