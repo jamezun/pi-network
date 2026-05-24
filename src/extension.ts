@@ -421,7 +421,7 @@ function refreshAgentsFromBroker() {
   refreshRemotePeers();
 }
 
-/** Ping remote peers from config and merge into agents array. Runs independently. */
+/** Ping remote peers from config and merge ALL their sessions into agents. Runs independently. */
 function refreshRemotePeers() {
   const configPeers = (config as any)?.peers;
   if (!configPeers || typeof configPeers !== "object") return;
@@ -430,58 +430,87 @@ function refreshRemotePeers() {
 
   Promise.all(peerNames.map(async (peerName: string) => {
     const peerCfg = configPeers[peerName];
-    if (!peerCfg?.host) return null;
+    if (!peerCfg?.host) return { machine: peerName, sessions: [], online: false };
     const port = peerCfg.bridgePort || config.bridgePort;
     const baseUrl = `http://${peerCfg.host}:${port}`;
     try {
       const res = await fetch(`${baseUrl}/status`, { signal: AbortSignal.timeout(3000) });
       const data = await res.json();
-      const displayName = data.sessionName || data.name || peerName;
       return {
-        name: displayName,
-        status: data.online ? "online" as const : "offline" as const,
-        rawStatus: data.status || "online",
-        role: "worker" as const,
-        runtime: "pi" as const,
-        capabilities: [] as string[],
-        specialties: [] as string[],
-        sessionName: displayName,
+        machine: peerName,
+        online: data.online,
+        sessionName: data.sessionName || data.name,
         model: data.model,
-        cwd: data.cwd || "",
-        heartbeatAt: Date.now(),
-        staleCount: 0,
-        remote: true,
-        configName: peerName,
         host: peerCfg.host,
         bridgePort: port,
+        sessions: (data.sessions || []).map((s: any) => ({
+          name: s.name || s.sessionName || peerName,
+          status: s.status === "online" || s.status === "idle" || s.rawStatus?.includes("idle") ? "online" : s.status === "busy" ? "busy" : "online",
+          rawStatus: s.rawStatus || s.status,
+          runtime: s.runtime || "pi",
+          model: s.model,
+          pid: s.pid,
+          cwd: s.cwd || "",
+        })),
       };
     } catch {
-      return {
-        name: peerName,
-        status: "offline" as const,
-        rawStatus: "offline",
-        role: "worker" as const,
-        runtime: "pi" as const,
-        capabilities: [] as string[],
-        specialties: [] as string[],
-        sessionName: peerName,
-        heartbeatAt: 0,
-        staleCount: 0,
-        remote: true,
-        configName: peerName,
-        host: peerCfg.host,
-        bridgePort: peerCfg.bridgePort || config.bridgePort,
-      };
+      return { machine: peerName, sessions: [], online: false };
     }
-  })).then((remotePeers) => {
-    const valid = remotePeers.filter(Boolean) as any[];
-    if (valid.length === 0) return;
-    for (const rp of valid) {
-      const existingIdx = agents.findIndex(a => (a as any).remote && ((a as any).configName || a.name).toLowerCase() === ((rp as any).configName || rp.name).toLowerCase());
-      if (existingIdx >= 0) {
-        Object.assign(agents[existingIdx], rp);
-      } else if (!agents.some(a => a.name.toLowerCase() === rp.name.toLowerCase())) {
-        agents.push(rp);
+  })).then((results) => {
+    for (const result of results) {
+      if (!result) continue;
+      const { machine, sessions, online, host, bridgePort } = result;
+
+      if (!online || sessions.length === 0) {
+        // Machine offline or no sessions — show as single offline peer
+        const existingIdx = agents.findIndex(a => (a as any).remote && ((a as any).configName || "").toLowerCase() === machine.toLowerCase());
+        if (existingIdx >= 0) {
+          Object.assign(agents[existingIdx], { status: "offline", rawStatus: "offline" });
+        }
+        continue;
+      }
+
+      // Add ALL sessions from the remote machine
+      for (const rs of sessions) {
+        const matchKey = `${machine}:${rs.name}`.toLowerCase();
+        const existingIdx = agents.findIndex(a =>
+          (a as any).remote
+          && ((a as any).matchKey === matchKey
+            || ((a as any).configName || "").toLowerCase() === machine.toLowerCase() && a.name.toLowerCase() === rs.name.toLowerCase())
+        );
+        const agent = {
+          name: rs.name,
+          status: rs.status,
+          rawStatus: rs.rawStatus,
+          role: "worker" as const,
+          runtime: rs.runtime,
+          capabilities: [] as string[],
+          specialties: [] as string[],
+          sessionName: rs.name,
+          model: rs.model,
+          cwd: rs.cwd,
+          heartbeatAt: Date.now(),
+          staleCount: 0,
+          remote: true,
+          configName: machine,
+          matchKey,
+          host: host,
+          bridgePort: bridgePort,
+        };
+        if (existingIdx >= 0) {
+          Object.assign(agents[existingIdx], agent);
+        } else if (!agents.some(a => a.name.toLowerCase() === rs.name.toLowerCase())) {
+          agents.push(agent as any);
+        }
+      }
+
+      // Remove stale remote agents from this machine (sessions that no longer exist)
+      const currentNames = new Set(sessions.map(s => s.name.toLowerCase()));
+      for (let i = agents.length - 1; i >= 0; i--) {
+        const a = agents[i] as any;
+        if (a.remote && (a.configName || "").toLowerCase() === machine.toLowerCase() && !currentNames.has(a.name.toLowerCase())) {
+          agents.splice(i, 1);
+        }
       }
     }
     // Update footer count
@@ -552,6 +581,18 @@ function startLocalBridge(port: number) {
       // Pull the freshest context usage from the local registry entry
       // (heartbeat writes it every 30s).
       const localEntry = readRegistryEntry(config.localName);
+      // Include ALL local broker sessions so remote peers can discover them
+      const allSessions = agents
+        .filter(a => !(a as any).remote && a.status !== "offline")
+        .map(a => ({
+          name: a.sessionName || a.name,
+          status: a.status,
+          rawStatus: a.rawStatus,
+          runtime: a.runtime || "pi",
+          model: a.model,
+          pid: a.pid,
+          cwd: a.cwd || "",
+        }));
       res.end(JSON.stringify({
         name: config.localName,
         sessionName: pi.getSessionName?.() || "unknown",
@@ -564,6 +605,7 @@ function startLocalBridge(port: number) {
         model: currentModel,
         color: config.color,
         purpose: config.purpose,
+        sessions: allSessions,
       }));
       return;
     }
