@@ -51,6 +51,7 @@ import type { DamageControlRules } from "./core/damage-control";
 import { loadPersonaFiles } from "./core/personas";
 import { BrokerClient } from "./broker/client";
 import { spawnBrokerIfNeeded } from "./broker/spawn";
+import { discoverClaudeSessions } from "./core/claude-discovery";
 import { IdleQueue } from "./core/idle-queue";
 import { loadConfirmConfig, shouldConfirm, formatConfirmPrompt } from "./core/confirm-send";
 import { PresenceManager } from "./core/presence";
@@ -279,16 +280,20 @@ function attachBrokerClientHandlers(client: BrokerClient): void {
 // Check if target matches current session (local self-delivery)
 // Refresh agents array from broker sessions (async, fire-and-forget)
 function refreshAgentsFromBroker() {
-  if (!brokerClient?.isConnected()) { agents = loadRegistry(); return; }
-  brokerClient.listSessions().then(sessions => {
-    agents = sessions
-      .filter(s => s.id !== currentSessionId)
-      .map(s => ({
+  // Get pi sessions from broker
+  const piSessionsPromise = brokerClient?.isConnected()
+    ? brokerClient.listSessions().catch(() => [] as any[])
+    : Promise.resolve([] as any[]);
+
+  piSessionsPromise.then(piSessions => {
+    const piAgents = piSessions
+      .filter((s: any) => s.id !== currentSessionId)
+      .map((s: any) => ({
         name: s.name || s.id.slice(0, 8),
         status: s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("\ud83d\udfe2") ? "online" : s.status?.includes("busy") || s.status?.includes("tool:") ? "busy" : "offline",
         rawStatus: s.status,
         role: s.role,
-        runtime: s.runtime,
+        runtime: s.runtime || "pi",
         capabilities: s.capabilities || [],
         specialties: s.specialties || [],
         model: s.model,
@@ -302,9 +307,34 @@ function refreshAgentsFromBroker() {
         project: s.project,
         startedAt: s.startedAt,
       }));
+
+    // Merge Claude sessions (discovered from ~/.claude/sessions/)
+    const claudeSessions = discoverClaudeSessions();
+    const claudeAgents = claudeSessions.map(s => ({
+      name: s.name,
+      status: s.status === "idle" ? "online" : s.status === "busy" ? "busy" : "online",
+      rawStatus: s.status,
+      runtime: "claude" as const,
+      capabilities: [] as string[],
+      specialties: [] as string[],
+      model: s.model,
+      pid: s.pid,
+      sessionName: s.name,
+      cwd: s.cwd || "",
+      heartbeatAt: Date.now(),
+      staleCount: 0,
+      startedAt: s.startedAt,
+    }));
+
+    // Dedupe: Claude sessions may already be in broker if claude-bridge is running
+    const piNames = new Set(piAgents.map((a: any) => a.name.toLowerCase()));
+    const uniqueClaude = claudeAgents.filter((a: any) => !piNames.has(a.name.toLowerCase()));
+
+    agents = [...piAgents, ...uniqueClaude];
+
     const ctx = getLiveContext();
     if (ctx) {
-      const onlineCount = agents.filter(a => a.status !== "offline").length;
+      const onlineCount = agents.filter((a: any) => a.status !== "offline").length;
       ctx.ui.setStatus("bridge", `\ud83c\udf10 ${mode.toUpperCase()} | ${onlineCount}/${Math.max(agents.length, 1)} peers`);
     }
   }).catch(() => { agents = loadRegistry(); });
@@ -2342,20 +2372,28 @@ export default function extension(api: ExtensionAPI) {
 
       // /network status → show peers and connection info
       if (subcommand === "status" || !subcommand) {
-        let sessions: any[] = [];
-        try { if (brokerClient?.isConnected()) sessions = await brokerClient.listSessions(); } catch {}
-        const others = sessions.filter(s => s.id !== currentSessionId);
-        const me = sessions.find(s => s.id === currentSessionId);
+        // Collect pi sessions from broker
+        let piSessions: any[] = [];
+        try { if (brokerClient?.isConnected()) piSessions = await brokerClient.listSessions(); } catch {}
+        const others = piSessions.filter((s: any) => s.id !== currentSessionId);
+        const me = piSessions.find((s: any) => s.id === currentSessionId);
+        // Collect Claude sessions from ~/.claude/sessions/
+        const claudeSessions = discoverClaudeSessions();
         let status = `📡 **Network Status**\n`;
         status += `You: **${me?.name || pi.getSessionName?.() || config.localName}** [${detectRuntime()}]\n`;
         status += `Broker: ${brokerClient?.isConnected() ? "connected" : "disconnected"}\n`;
-        if (others.length > 0) {
+        if (others.length > 0 || claudeSessions.length > 0) {
           status += `\nPeers:\n`;
           for (const s of others) {
             const icon = (s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("🟢")) ? "🟢" : (s.status?.includes("busy") || s.status?.includes("tool:")) ? "🟡" : "🔴";
             const rt = s.runtime === "claude" ? "claude" : s.runtime === "pi" ? "pi" : "?";
             const model = (s.model || "?").replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
             status += `${icon} ${s.name || s.id.slice(0, 8)} [${rt}] ${model}\n`;
+          }
+          for (const s of claudeSessions) {
+            const icon = s.status === "idle" || s.status === "online" ? "🟢" : "🟡";
+            const model = (s.model || "claude").replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
+            status += `${icon} ${s.name} [claude] ${model}\n`;
           }
         } else {
           status += `No other sessions.\n`;
@@ -2364,7 +2402,7 @@ export default function extension(api: ExtensionAPI) {
         return;
       }
 
-      // /network send → pick peer and compose message
+            // /network send → pick peer and compose message
       if (subcommand === "send") {
         if (!ctx.hasUI) {
           ctx.ui.notify("❌ /network send requires interactive TUI", "warning");
