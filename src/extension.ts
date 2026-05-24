@@ -207,7 +207,9 @@ async function ensureBrokerConnected(reason: "startup" | "background" | "tool" |
     try {
       await spawnBrokerIfNeeded();
       await nextClient.connect({
-        name: config.localName, cwd: ctx.cwd, model: currentModel, pid: process.pid,
+        name: pi.getSessionName?.() || config.localName, // Real session name for discovery
+        localName: config.localName,                     // Machine identity for routing
+        cwd: ctx.cwd, model: currentModel, pid: process.pid,
         startedAt: sessionStartedAt!, lastActivity: Date.now(),
         status: presenceManager.formatState(), role: config.role,
         capabilities: config.capabilities, specialties: config.specialties,
@@ -269,6 +271,7 @@ function currentSessionTargetMatches(to: string, resolvedTo?: string | null, act
   add(currentSessionId);
   add(activeClient?.sessionId);
   add(config.localName);
+  add(pi.getSessionName?.());  // Match real session name too
   return Boolean(resolvedTo && activeClient?.sessionId && resolvedTo === activeClient.sessionId) || targets.has(to.trim().toLowerCase());
 }
 
@@ -1379,11 +1382,29 @@ export default function extension(api: ExtensionAPI) {
       }
 
       const lines: string[] = ["## Network Status\n"];
-      for (const agent of agents) {
-        if (agent.name === config.localName) continue;
-        const icon = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : agent.status === "unresponsive" ? "🟠" : "🔴";
-        const ctxBar = agent.contextUsedPct != null ? ` ${buildCtxBar(agent.contextUsedPct, null)}` : "";
-        lines.push(`${icon} **${agent.name}** (${agent.role}) — ${agent.capabilities.join(", ")}${ctxBar}`);
+
+      // Try broker sessions first (shows real session names like pi-intercom)
+      let brokerSessions: any[] = [];
+      try { if (brokerClient?.isConnected()) brokerSessions = await brokerClient.listSessions(); } catch {}
+
+      if (brokerSessions.length > 0) {
+        const others = brokerSessions.filter(s => s.id !== currentSessionId);
+        if (others.length === 0) lines.push("No other sessions online.");
+        for (const s of others) {
+          const icon = s.status === "online" || s.status === "idle" ? "🟢" : s.status === "busy" ? "🟡" : "🔴";
+          const role = s.role || "unknown";
+          const caps = s.capabilities?.join(", ") || "";
+          const ctx = s.contextUsedPct != null ? ` ${buildCtxBar(s.contextUsedPct, null)}` : "";
+          lines.push(`${icon} **${s.name || s.id.slice(0, 8)}** (${role})${caps ? ` — ${caps}` : ""}${ctx}`);
+        }
+      } else {
+        // Fall back to file-based registry
+        for (const agent of agents) {
+          if (agent.name === config.localName) continue;
+          const icon = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : agent.status === "unresponsive" ? "🟠" : "🔴";
+          const ctxBar = agent.contextUsedPct != null ? ` ${buildCtxBar(agent.contextUsedPct, null)}` : "";
+          lines.push(`${icon} **${agent.name}** (${agent.role}) — ${agent.capabilities.join(", ")}${ctxBar}`);
+        }
       }
       return { content: [{ type: "text", text: lines.join("\n") }] };
     },
@@ -1694,8 +1715,17 @@ export default function extension(api: ExtensionAPI) {
         case "status": {
           const connected = brokerClient?.isConnected() ?? false;
           const pending = replyTracker.listPending();
+          let sessions: any[] = [];
+          try { if (connected) sessions = await brokerClient.listSessions(); } catch {}
+          const others = sessions.filter(s => s.id !== currentSessionId);
           return {
-            content: [{ type: "text", text: `Connected: ${connected ? `Yes (${currentSessionId?.slice(0, 8)})` : "No"}\nPending asks: ${pending.length}${pending.length > 0 ? "\n" + pending.map(p => `  • ${p.from.name}: ${p.message.content.text.slice(0, 60)}...`).join("\n") : ""}` }],
+            content: [{ type: "text", text: 
+              `Connected: ${connected ? `Yes (${currentSessionId?.slice(0, 8)})` : "No"}\n` +
+              `Session: ${pi.getSessionName?.() || config.localName}\n` +
+              `Role: ${config.role}\n` +
+              `Peers: ${others.length > 0 ? others.map(s => s.name || s.id.slice(0, 8)).join(", ") : "none"}\n` +
+              `Pending asks: ${pending.length}${pending.length > 0 ? "\n" + pending.map(p => `  • ${p.from.name}: ${p.message.content.text.slice(0, 60)}...`).join("\n") : ""}`
+            }],
           };
         }
 
