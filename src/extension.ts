@@ -279,10 +279,16 @@ function attachBrokerClientHandlers(client: BrokerClient): void {
 
 // Check if target matches current session (local self-delivery)
 // Refresh agents array from broker sessions (async, fire-and-forget)
+const DEBUG_LOG = require("os").homedir() + "/.pi/agent/network/debug.log";
+function debugLog(msg: string) {
+  try { require("fs").appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
+}
+
 function refreshAgentsFromBroker() {
+  debugLog(`refreshAgentsFromBroker: brokerClient=${brokerClient ? "exists" : "null"} isConnected=${brokerClient?.isConnected?.()}`);
   // Get pi sessions from broker
   const piSessionsPromise = brokerClient?.isConnected()
-    ? brokerClient.listSessions().catch(() => [] as any[])
+    ? brokerClient.listSessions().then(s => { debugLog(`broker returned ${s.length} sessions`); return s; }).catch((e: any) => { debugLog(`broker list error: ${e.message}`); return [] as any[]; })
     : Promise.resolve([] as any[]);
 
   piSessionsPromise.then(piSessions => {
@@ -310,6 +316,7 @@ function refreshAgentsFromBroker() {
 
     // Merge Claude sessions (discovered from ~/.claude/sessions/)
     const claudeSessions = discoverClaudeSessions();
+    debugLog(`claude discovery: ${claudeSessions.length} sessions, piAgents: ${piAgents.length}`);
     const claudeAgents = claudeSessions.map(s => ({
       name: s.name,
       status: s.status === "idle" ? "online" : s.status === "busy" ? "busy" : "online",
@@ -747,9 +754,11 @@ export default function extension(api: ExtensionAPI) {
     startupConnectTimer = setTimeout(() => {
       startupConnectTimer = null;
       if (!getLiveContext(ctx, startupGen)) return;
+      debugLog("startup: ensureBrokerConnected called");
       ensureBrokerConnected("startup")
-        .then(() => notifyIfLive(ctx, "🔗 Connected to auto-discovery broker", "info", startupGen))
+        .then((client) => { debugLog(`startup: broker connected! sessionId=${client.sessionId?.slice(0,8)} isConnected=${client.isConnected()}`); notifyIfLive(ctx, "🔗 Connected to auto-discovery broker", "info", startupGen); })
         .catch((e: any) => {
+          debugLog(`startup: broker FAILED: ${e.message}`);
           if (!getLiveContext(ctx, startupGen)) return;
           notifyIfLive(ctx, `⚠️ Broker unavailable: ${e.message} (continuing without auto-discovery)`, "warning", startupGen);
           brokerClient = null;
