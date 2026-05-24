@@ -335,7 +335,9 @@ function refreshAgentsFromBroker() {
     const ctx = getLiveContext();
     if (ctx) {
       const onlineCount = agents.filter((a: any) => a.status !== "offline").length;
-      ctx.ui.setStatus("bridge", `\ud83c\udf10 ${mode.toUpperCase()} | ${onlineCount}/${Math.max(agents.length, 1)} peers`);
+      const myName = pi.getSessionName?.() || config.localName;
+      const myModel = currentModel || '?';
+      ctx.ui.setStatus("bridge", `\ud83c\udf10 ${myName} [${detectRuntime()}] ${myModel} | ${onlineCount}/${agents.length} peers`);
     }
   }).catch(() => { agents = loadRegistry(); });
 }
@@ -797,8 +799,9 @@ export default function extension(api: ExtensionAPI) {
       contextUsedPct: 0,
     });
 
-    const onlineCount = agents.filter((a) => a.status !== "offline" && a.name !== config.localName).length;
-    ctx.ui.setStatus("bridge", `🌐 ${mode.toUpperCase()} | ${onlineCount}/${Math.max(Object.keys(config.peers).length, 1)} peers`);
+    // Initial status — refreshAgentsFromBroker will update with real peer count
+    const myName = pi.getSessionName?.() || config.localName;
+    ctx.ui.setStatus("bridge", `🌐 ${myName} [${detectRuntime()}] ${ctx.model?.id || "?"}`);
 
     // ─── Pool Widget ───
     ctx.ui.setWidget("pi-network-pool", (_tui: any, theme: any) => {
@@ -808,19 +811,16 @@ export default function extension(api: ExtensionAPI) {
           const header = `  🌐 ${mode.toUpperCase()} | project: ${config.project}`;
           lines.push(theme.fg("dim", header));
 
-          // Show broker sessions (live, real names)
-          if (brokerClient?.isConnected()) {
+          if (agents.length > 0) {
             for (const agent of agents) {
-              const dot = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : "🔴";
+              const dot = agent.status === "online" ? "\ud83d\udfe2" : agent.status === "busy" ? "\ud83d\udfe1" : "\ud83d\udd34";
               const color = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
               const rt = (agent as any).runtime === "claude" ? theme.fg("dim", " [claude]") : (agent as any).runtime === "pi" ? theme.fg("dim", " [pi]") : "";
               const model = agent.model ? theme.fg("dim", ` ${abbreviateModel(agent.model)}`) : "";
               lines.push(`  ${dot} ${color}${rt}${model}`);
             }
-          }
-
-          if (lines.length <= 1) {
-            lines.push(theme.fg("dim", "  No peers discovered yet"));
+          } else {
+            lines.push(theme.fg("dim", "  Discovering peers..."));
           }
 
           return lines;
