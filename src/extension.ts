@@ -342,9 +342,7 @@ function refreshAgentsFromBroker() {
     const ctx = getLiveContext();
     if (ctx) {
       const onlineCount = agents.filter((a: any) => a.status !== "offline").length;
-      const myName = pi.getSessionName?.() || config.localName;
-      const myModel = currentModel || '?';
-      ctx.ui.setStatus("bridge", `\ud83c\udf10 ${myName} [${detectRuntime()}] ${myModel} | ${onlineCount}/${agents.length} peers`);
+      ctx.ui.setStatus("bridge", `\ud83c\udf10 ${onlineCount}/${agents.length} peers online`);
     }
   }).catch(() => { agents = loadRegistry(); });
 }
@@ -658,6 +656,7 @@ export default function extension(api: ExtensionAPI) {
   pi.registerFlag("explicit", { description: "Hide from auto-discovery; addressable only by exact name", type: "boolean", default: false });
 
   pi.on("session_start", async (_event, ctx) => {
+    debugLog(`session_start fired! cwd=${ctx.cwd}`);
     // ─── Lifecycle safety ───
     shuttingDown = false;
     disposed = false;
@@ -700,7 +699,7 @@ export default function extension(api: ExtensionAPI) {
         damageControlRules.readOnlyPaths.length +
         damageControlRules.noDeletePaths.length;
       ctx.ui.notify(`🛡️ Damage Control: ${ruleCount} rules loaded`, "info");
-      ctx.ui.setStatus("damage-control", `🛡️ ${ruleCount} Rules`);
+      // damage-control status intentionally not shown in footer
     }
 
     // Load persona files and apply matching one to local config
@@ -808,16 +807,15 @@ export default function extension(api: ExtensionAPI) {
       contextUsedPct: 0,
     });
 
-    // Initial status — refreshAgentsFromBroker will update with real peer count
-    const myName = pi.getSessionName?.() || config.localName;
-    ctx.ui.setStatus("bridge", `🌐 ${myName} [${detectRuntime()}] ${ctx.model?.id || "?"}`);
+    // Initial status — will update once broker connects
+    ctx.ui.setStatus("bridge", `🌐 Connecting...`);
 
     // ─── Pool Widget ───
     ctx.ui.setWidget("pi-network-pool", (_tui: any, theme: any) => {
       return {
         render(width: number) {
           const lines: string[] = [];
-          const header = `  🌐 ${mode.toUpperCase()} | project: ${config.project}`;
+          const header = `  🌐 Pi Network`;
           lines.push(theme.fg("dim", header));
 
           if (agents.length > 0) {
@@ -838,7 +836,7 @@ export default function extension(api: ExtensionAPI) {
     });
 
     // ─── Phase 1.8: Presence status widget ───
-    ctx.ui.setStatus("presence", presenceManager.formatState());
+    // presence status intentionally not shown in footer
 
     transport.onMessage((msg) => {
       if (msg.type === "message" && msg.payload) {
