@@ -89,7 +89,7 @@ export function buildAgentPrompt(
   if (offline.length > 0) {
     prompt += "### 🔴 Offline (tasks will be queued)\n";
     for (const a of offline) {
-      prompt += `- ~~**${a.name}**~~ (${a.role}) — ${a.capabilities.join(", ")}\n`;
+      prompt += `- ~~**${a.name}**~~ (${a.role})\n`;
     }
     prompt += "\n";
   }

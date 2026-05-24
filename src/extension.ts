@@ -333,24 +333,11 @@ function refreshAgentsFromBroker() {
         startedAt: s.startedAt,
       }));
 
-    // Merge Claude sessions (discovered from ~/.claude/sessions/)
+    // Merge Claude sessions discovered from ~/.claude/sessions/
+    // Only include Claude sessions that are also registered with the broker,
+    // since unregistered Claude sessions can't receive mesh messages.
     const claudeSessions = discoverClaudeSessions();
-    // merged claude + broker sessions
-    const claudeAgents = claudeSessions.map(s => ({
-      name: s.name,
-      status: s.status === "idle" ? "online" : s.status === "busy" ? "busy" : "online",
-      rawStatus: s.status,
-      runtime: "claude" as const,
-      capabilities: [] as string[],
-      specialties: [] as string[],
-      model: s.model,
-      pid: s.pid,
-      sessionName: s.name,
-      cwd: s.cwd || "",
-      heartbeatAt: Date.now(),
-      staleCount: 0,
-      startedAt: s.startedAt,
-    }));
+    const claudeSessionPids = new Set(claudeSessions.map(s => s.pid));
 
     // Dedupe broker sessions: same name from different session IDs (stale registrations)
     const seen = new Set<string>();
@@ -361,9 +348,32 @@ function refreshAgentsFromBroker() {
       return true;
     });
 
-    // Dedupe: Claude sessions may already be in broker if claude-bridge is running
-    const piNames = new Set(dedupedPi.map((a: any) => a.name.toLowerCase()));
-    const uniqueClaude = claudeAgents.filter((a: any) => !piNames.has(a.name.toLowerCase()));
+    // Only add Claude sessions that are registered with the broker (connected to mesh)
+    // A Claude session registered with the broker has a matching PID in both lists.
+    const piPids = new Set(dedupedPi.filter((a: any) => a.pid).map((a: any) => a.pid));
+    const uniqueClaude = claudeSessions
+      .filter(s => !piPids.has(s.pid))  // Not already in broker as a pi session
+      .filter(s => {
+        // Only include if the broker also knows about this Claude session
+        // (i.e., claude-bridge registered it). Check by matching PID in broker sessions.
+        const brokerPidMatch = piSessions.some((bs: any) => bs.pid === s.pid);
+        return brokerPidMatch;
+      })
+      .map(s => ({
+        name: s.name,
+        status: s.status === "idle" ? "online" : s.status === "busy" ? "busy" : "online",
+        rawStatus: s.status,
+        runtime: "claude" as const,
+        capabilities: [] as string[],
+        specialties: [] as string[],
+        model: s.model,
+        pid: s.pid,
+        sessionName: s.name,
+        cwd: s.cwd || "",
+        heartbeatAt: Date.now(),
+        staleCount: 0,
+        startedAt: s.startedAt,
+      }));
 
     agents = [...dedupedPi, ...uniqueClaude];
 
