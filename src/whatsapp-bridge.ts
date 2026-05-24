@@ -85,6 +85,7 @@ export class WhatsAppBridge {
   }
 
   private async handleInboundMessage(msg: any): Promise<void> {
+    console.log(`WhatsAppBridge.handleInboundMessage: type=${msg.type} from=${msg.from}`);
     if (msg.type !== "whatsapp-command") return;
 
     // Security check
@@ -95,11 +96,13 @@ export class WhatsAppBridge {
     });
 
     if (!securityResult.allowed) {
+      console.log(`WhatsAppBridge: security blocked ${msg.from}: ${securityResult.reason}`);
       this.security.logCommand(msg.from, msg.raw, `blocked: ${securityResult.reason}`);
       return;
     }
 
     const parsed: ParsedCommand = msg.parsed;
+    console.log(`WhatsAppBridge: routing parsed.type=${parsed.type}`);
 
     try {
       switch (parsed.type) {
@@ -261,9 +264,10 @@ export class WhatsAppBridge {
   }
 
   private async sendReply(from: string, text: string): Promise<void> {
+    console.log(`WhatsAppBridge.sendReply: to=${from} text=${text.substring(0, 50)}`);
     // Route through WhatsApp transport
     try {
-      await fetch(`${this.waConfig.evolutionApiUrl}/message/sendText/${this.waConfig.instanceName}`, {
+      const res = await fetch(`${this.waConfig.evolutionApiUrl}/message/sendText/${this.waConfig.instanceName}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -271,7 +275,15 @@ export class WhatsAppBridge {
         },
         body: JSON.stringify({ number: from, text }),
       });
-    } catch {}
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        console.error(`WhatsAppBridge.sendReply FAILED: ${res.status} ${body}`);
+      } else {
+        console.log(`WhatsAppBridge.sendReply: sent successfully`);
+      }
+    } catch (e: any) {
+      console.error(`WhatsAppBridge.sendReply error: ${e.message}`);
+    }
   }
 
   /**

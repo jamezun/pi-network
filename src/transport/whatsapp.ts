@@ -174,7 +174,8 @@ export class WhatsAppTransport implements Transport {
     if (!text.startsWith(this.waConfig.commandPrefix) && !text.startsWith("@")) return;
 
     const parsed = parseCommand(text, this.waConfig.commandPrefix);
-    if (parsed.type === "unknown") return;
+    console.log(`WhatsApp parsed: type=${parsed.type} command=${(parsed as any).command || "n/a"}`);
+    if (parsed.type === "unknown") { console.log(`WhatsApp: unknown command, ignoring`); return; }
 
     this.messageHandler({
       type: "whatsapp-command",
