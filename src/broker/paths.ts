@@ -12,7 +12,7 @@ function sanitizePipeSegment(value: string): string {
 }
 
 export function getBrokerDir(homeDir: string = homedir()): string {
-  return join(homeDir, ".pi/agent/network");
+  return join(homeDir, ".pi/agent/intercom");
 }
 
 export function getBrokerSocketPath(

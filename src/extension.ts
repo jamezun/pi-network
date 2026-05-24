@@ -279,17 +279,60 @@ function attachBrokerClientHandlers(client: BrokerClient): void {
 
 // Check if target matches current session (local self-delivery)
 // Refresh agents array from broker sessions (async, fire-and-forget)
-const DEBUG_LOG = require("os").homedir() + "/.pi/agent/network/debug.log";
+const DEBUG_LOG = require("os").homedir() + "/.pi/agent/intercom/pi-network-debug.log";
 function debugLog(msg: string) {
   try { require("fs").appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
 }
 
+function rawBrokerList(): Promise<any[]> {
+  return new Promise((resolve) => {
+    try {
+      const net = require("net");
+      const fs = require("fs");
+      const os = require("os");
+      const sockPath = require("path").join(os.homedir(), ".pi/agent/intercom/broker.sock");
+      if (!fs.existsSync(sockPath)) { resolve([]); return; }
+      const sock = net.connect(sockPath);
+      let buf = Buffer.alloc(0);
+      let settled = false;
+      const timer = setTimeout(() => { settled = true; sock.destroy(); resolve([]); }, 4000);
+      function wm(s: any, m: any) {
+        const j = JSON.stringify(m), p = Buffer.from(j), h = Buffer.alloc(4);
+        h.writeUInt32BE(p.length, 0); s.write(Buffer.concat([h, p]));
+      }
+      sock.on("data", (d: Buffer) => {
+        buf = Buffer.concat([buf, d]);
+        while (buf.length >= 4) {
+          const len = buf.readUInt32BE(0);
+          if (buf.length < 4 + len) break;
+          const msg = JSON.parse(buf.subarray(4, 4 + len).toString());
+          buf = buf.subarray(4 + len);
+          if (msg.type === "registered") {
+            wm(sock, { type: "list", requestId: "raw-list" });
+          }
+          if (msg.type === "sessions") {
+            if (!settled) { clearTimeout(timer); settled = true; resolve(msg.sessions || []); }
+            sock.end();
+          }
+        }
+      });
+      sock.on("error", () => { clearTimeout(timer); resolve([]); });
+      wm(sock, {
+        type: "register",
+        session: {
+          name: "pi-network-raw", localName: config.localName, runtime: "pi",
+          cwd: process.cwd(), model: currentModel || "unknown", pid: process.pid,
+          startedAt: Date.now(), lastActivity: Date.now(), status: "online",
+          capabilities: [], specialties: [],
+        }
+      });
+    } catch { resolve([]); }
+  });
+}
+
 function refreshAgentsFromBroker() {
-  debugLog(`refreshAgentsFromBroker: brokerClient=${brokerClient ? "exists" : "null"} isConnected=${brokerClient?.isConnected?.()}`);
-  // Get pi sessions from broker
-  const piSessionsPromise = brokerClient?.isConnected()
-    ? brokerClient.listSessions().then(s => { debugLog(`broker returned ${s.length} sessions`); return s; }).catch((e: any) => { debugLog(`broker list error: ${e.message}`); return [] as any[]; })
-    : Promise.resolve([] as any[]);
+  debugLog(`refreshAgentsFromBroker: using rawBrokerList`);
+  const piSessionsPromise = rawBrokerList();
 
   piSessionsPromise.then(piSessions => {
     const piAgents = piSessions
