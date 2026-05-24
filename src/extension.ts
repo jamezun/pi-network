@@ -2480,10 +2480,13 @@ export default function extension(api: ExtensionAPI) {
           ctx.ui.notify("❌ /network send requires interactive TUI", "warning");
           return;
         }
-        agents = loadRegistry();
-        const onlinePeers = agents.filter(a => a.name !== config.localName && a.status === "online");
+        const currentName = pi.getSessionName?.() || config.localName;
+        const onlinePeers = agents.filter(a => 
+          a.name !== currentName && a.name !== config.localName && 
+          (a.status === "online" || a.status?.includes("idle") || a.status?.includes("online"))
+        );
         if (onlinePeers.length === 0) {
-          ctx.ui.notify("No peers online to message", "warning");
+          ctx.ui.notify(`No peers online (have ${agents.length} agents, status: ${agents.map(a=>a.name+":"+a.status).join(", ")})`, "warning");
           return;
         }
 
@@ -2590,8 +2593,11 @@ export default function extension(api: ExtensionAPI) {
   pi.registerShortcut("alt+n", {
     description: "Open network compose (send message to mesh peer)",
     handler: async (ctx) => {
-      agents = loadRegistry();
-      const onlinePeers = agents.filter(a => a.name !== config.localName && a.status === "online");
+      const currentName = pi.getSessionName?.() || config.localName;
+      const onlinePeers = agents.filter(a => 
+        a.name !== currentName && a.name !== config.localName && 
+        (a.status === "online" || a.status?.includes("idle") || a.status?.includes("online"))
+      );
       if (onlinePeers.length === 0) {
         ctx.ui.notify("No peers online to message", "warning");
         return;
