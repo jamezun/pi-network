@@ -313,6 +313,7 @@ function refreshAgentsFromBroker() {
   piSessionsPromise.then(piSessions => {
     const piAgents = piSessions
       .filter((s: any) => s.id !== currentSessionId)
+      .filter((s: any) => s.status !== "external")  // Skip virtual/bridged Claude sessions (can't handle mesh tasks)
       .map((s: any) => ({
         name: s.name || s.id.slice(0, 8),
         status: s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("\ud83d\udfe2") ? "online" : s.status?.includes("busy") || s.status?.includes("tool:") ? "busy" : "offline",

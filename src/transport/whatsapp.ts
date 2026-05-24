@@ -137,15 +137,16 @@ export class WhatsAppTransport implements Transport {
             headers: { apikey: this.waConfig.evolutionApiKey },
           },
         );
-        if (!res.ok) return;
+        if (!res.ok) { console.error(`WhatsApp poll failed: ${res.status}`); return; }
         const data = await res.json();
         // Process messages — filter and route
-        if (Array.isArray(data)) {
+        if (Array.isArray(data) && data.length > 0) {
+          console.log(`WhatsApp: received ${data.length} messages`);
           for (const msg of data) {
             this.processInboundMessage(msg);
           }
         }
-      } catch {}
+      } catch (e: any) { console.error(`WhatsApp poll error: ${e.message}`); }
     }, 5000);
     try { (this.pollingInterval as any).unref?.(); } catch {}
   }
@@ -160,12 +161,14 @@ export class WhatsAppTransport implements Transport {
 
     const jid = msg.key.remoteJid;
     const number = jid.replace("@s.whatsapp.net", "").replace("@g.us", "");
+    console.log(`WhatsApp inbound: number=${number} text=${text.substring(0, 30)}`);
 
     // Group filter
     if (this.waConfig.dedicatedGroupJid && jid !== this.waConfig.dedicatedGroupJid) return;
 
     // Number allowlist
-    if (!this.waConfig.allowedNumbers.some(n => number.includes(n.replace("+", "")))) return;
+    const allowed = this.waConfig.allowedNumbers.some(n => number.includes(n.replace("+", "")));
+    if (!allowed) { console.log(`WhatsApp: ${number} not in allowlist [${this.waConfig.allowedNumbers.join(",")}]`); return; }
 
     // Command prefix filter
     if (!text.startsWith(this.waConfig.commandPrefix) && !text.startsWith("@")) return;
