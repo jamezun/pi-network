@@ -43,7 +43,21 @@ export class WhatsAppBridge {
   private waTransport: WhatsAppTransport | null = null;
   private running = false;
 
-  constructor(config: BridgeConfig, transport: Transport) {
+  /** Get agents from live broker data, falling back to file registry */
+  private getAgents(): any[] {
+    const live = this.getLiveAgents?.();
+    if (live && live.length > 0) return live;
+    return this.getAgents();
+  }
+
+  /** Get online agent names for peer matching */
+  private getOnlinePeers(): string[] {
+    return this.getAgents()
+      .filter(a => a.status === "online" || a.status?.includes("idle") || a.status?.includes("online") || a.status?.startsWith("🟢"))
+      .map(a => a.name);
+  }
+
+  constructor(config: BridgeConfig, transport: Transport, private getLiveAgents?: () => any[]) {
     this.config = config;
     this.waConfig = (config as any).whatsapp as WhatsAppBridgeConfig;
     this.meshTransport = transport;
@@ -74,11 +88,11 @@ export class WhatsAppBridge {
     await this.waTransport.start();
 
     // Feed known peers to the parser for fuzzy matching
-    const agents = loadRegistry();
+    const agents = this.getAgents();
     this.waTransport.setPeers(agents.map(a => a.name));
     // Refresh peers periodically
     this.peerRefreshInterval = setInterval(() => {
-      const a = loadRegistry();
+      const a = this.getAgents();
       if (this.waTransport) this.waTransport.setPeers(a.map(ag => ag.name));
     }, 30000);
 
@@ -163,7 +177,7 @@ export class WhatsAppBridge {
       return;
     }
 
-    const agents = loadRegistry();
+    const agents = this.getAgents();
     const matched = fuzzyMatchPeer(parsed.peer, agents.map(a => a.name));
     const peer = matched ? agents.find(a => a.name === matched) : null;
     this.knownPeers = agents.map(a => a.name);
@@ -172,7 +186,7 @@ export class WhatsAppBridge {
       return;
     }
 
-    if (peer.status === "offline") {
+    if (peer.status === "offline" || peer.status?.startsWith("🔴") || peer.status?.startsWith("⚫")) {
       await this.sendReply(from, formatOfflinePeer(parsed.peer));
       return;
     }
@@ -216,7 +230,7 @@ export class WhatsAppBridge {
       return;
     }
 
-    const agents = loadRegistry().filter(a => a.status === "online" || a.status === "busy");
+    const agents = this.getAgents().filter(a => a.status === "online" || a.status === "busy" || a.status?.includes("idle") || a.status?.startsWith("🟢") || a.status?.startsWith("🟡"));
     if (agents.length === 0) {
       await this.sendReply(from, formatError("No online peers"));
       return;
@@ -253,12 +267,12 @@ export class WhatsAppBridge {
   }
 
   private async handleStatus(from: string): Promise<void> {
-    const agents = loadRegistry();
+    const agents = this.getAgents();
     await this.sendReply(from, formatNetworkStatus(agents, this.config.localName));
   }
 
   private async handlePeers(from: string): Promise<void> {
-    const agents = loadRegistry();
+    const agents = this.getAgents();
     await this.sendReply(from, formatPeerList(agents));
   }
 
@@ -273,7 +287,7 @@ export class WhatsAppBridge {
       return;
     }
     // Send kill to all peers
-    const agents = loadRegistry().filter(a => a.status === "online");
+    const agents = this.getAgents().filter(a => a.status === "online");
     for (const agent of agents) {
       await this.meshTransport.sendKill(agent.name, taskId).catch(() => {});
     }
