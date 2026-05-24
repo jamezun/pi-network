@@ -1184,7 +1184,8 @@ export default function extension(api: ExtensionAPI) {
       }
       if (parsed.type === "network_task_claimed") {
         // Someone claimed our task
-        const task = (await import("./core/task-claim")).getTask(parsed.taskId);
+        const { getTask } = require("./core/task-claim");
+        const task = getTask(parsed.taskId);
         if (task) {
           live.ui.notify(`✅ Task ${parsed.taskId} claimed by ${parsed.claimedBy}`, "info");
         }
@@ -2462,7 +2463,7 @@ export default function extension(api: ExtensionAPI) {
   }
 
   // ─── Task claiming system ───
-  const { postTask, claimTask, getOpenTasks, getAllTasks, setOnNewTask } = await import("./core/task-claim");
+  const { postTask, claimTask, getOpenTasks, getAllTasks, setOnNewTask } = require("./core/task-claim");
 
   // When a new task is posted, notify auto-claim peers
   setOnNewTask((task) => {
