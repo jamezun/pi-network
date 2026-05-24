@@ -115,7 +115,7 @@ export class BrokerClient extends EventEmitter {
         this.off("_registered", onRegistered);
         socket.off("error", onError);
         socket.off("close", onClose);
-        socket.off("data", reader);
+        // NOTE: do NOT remove reader — it's needed for ongoing message handling
         clearTimeout(timeout);
       };
 
