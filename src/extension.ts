@@ -381,7 +381,7 @@ function refreshAgentsFromBroker() {
     // Add WhatsApp number as a synthetic peer (receive-only, no work)
     const waCfg = (config as any)?.whatsapp;
     if (waCfg?.enabled && waCfg?.allowedNumbers?.length > 0) {
-      const waNumber = waCfg.allowedNumbers[0];
+      const waNumber = waCfg.allowedNumbers.length > 1 ? waCfg.allowedNumbers[waCfg.allowedNumbers.length - 1] : waCfg.allowedNumbers[0];
       const formatted = `+${waNumber.slice(0,3)}-${waNumber.slice(3)}`;
       // Don't add duplicate if somehow already present
       if (!agents.some(a => a.name === `📱${formatted}`)) {
@@ -1852,11 +1852,19 @@ export default function extension(api: ExtensionAPI) {
     return match ? match.join("") : target.replace(/[^0-9]/g, "");
   }
 
+  function getWhatsAppContactNumber(): string {
+    // The contact number is the last allowedNumber (bridge's own number is first)
+    const waCfg = (config as any)?.whatsapp;
+    if (!waCfg?.allowedNumbers?.length) return "";
+    return waCfg.allowedNumbers.length > 1 ? waCfg.allowedNumbers[waCfg.allowedNumbers.length - 1] : waCfg.allowedNumbers[0];
+  }
+
   async function sendToWhatsApp(target: string, text: string, files?: Array<{name: string, content: string}>): Promise<{content: Array<{type: string, text: string}>}> {
     if (!whatsappBridge) {
       return { content: [{ type: "text", text: "❌ WhatsApp bridge not running" }] };
     }
-    const number = extractWhatsAppNumber(target);
+    // Always send to the contact number, not the bridge's own number
+    const number = getWhatsAppContactNumber();
     try {
       // Send text
       await (whatsappBridge as any).sendReply(number, text);
