@@ -145,7 +145,7 @@ export class WhatsAppBridge {
     }
 
     const agents = loadRegistry();
-    const peer = agents.find(a => a.name === parsed.peer);
+    const peer = agents.find(a => a.name.toLowerCase() === parsed.peer?.toLowerCase());
     if (!peer) {
       await this.sendReply(from, formatUnknownPeer(parsed.peer, agents.map(a => a.name)));
       return;
