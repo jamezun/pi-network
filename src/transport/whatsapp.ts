@@ -1,6 +1,3 @@
-import { appendFileSync } from "fs";
-const WA_LOG = process.env.HOME + "/.pi/agent/intercom/wa-transport.log";
-function waLog(m: string) { appendFileSync(WA_LOG, "[" + new Date().toISOString() + "] " + m + "\n"); }
 // Pi Network — WhatsApp transport layer
 // Phase 2.2: Evolution API integration for WhatsApp messaging.
 
@@ -55,8 +52,8 @@ export class WhatsAppTransport implements Transport {
     }
 
     // Start polling for messages (websocket requires additional deps)
-    waLog("startPolling() called"); this.startPolling();
-    waLog(`WhatsApp transport started (instance: ${this.waConfig.instanceName})`);
+    console.log("startPolling() called"); this.startPolling();
+    console.log(`WhatsApp transport started (instance: ${this.waConfig.instanceName})`);
   }
 
   async stop(): Promise<void> {
@@ -140,16 +137,16 @@ export class WhatsAppTransport implements Transport {
             headers: { apikey: this.waConfig.evolutionApiKey },
           },
         );
-        if (!res.ok) { waLog(`WhatsApp poll failed: ${res.status}`); return; }
+        if (!res.ok) { console.log(`WhatsApp poll failed: ${res.status}`); return; }
         const data = await res.json();
         // Process messages — filter and route
         if (Array.isArray(data) && data.length > 0) {
-          waLog(`WhatsApp: received ${data.length} messages`);
+          console.log(`WhatsApp: received ${data.length} messages`);
           for (const msg of data) {
             this.processInboundMessage(msg);
           }
         }
-      } catch (e: any) { waLog(`WhatsApp poll error: ${e.message}`); }
+      } catch (e: any) { console.log(`WhatsApp poll error: ${e.message}`); }
     }, 5000);
     try { (this.pollingInterval as any).unref?.(); } catch {}
   }
@@ -164,21 +161,21 @@ export class WhatsAppTransport implements Transport {
 
     const jid = msg.key.remoteJid;
     const number = jid.replace("@s.whatsapp.net", "").replace("@g.us", "");
-    waLog(`WhatsApp inbound: number=${number} text=${text.substring(0, 30)}`);
+    console.log(`WhatsApp inbound: number=${number} text=${text.substring(0, 30)}`);
 
     // Group filter
     if (this.waConfig.dedicatedGroupJid && jid !== this.waConfig.dedicatedGroupJid) return;
 
     // Number allowlist
     const allowed = this.waConfig.allowedNumbers.some(n => number.includes(n.replace("+", "")));
-    if (!allowed) { waLog(`WhatsApp: ${number} not in allowlist [${this.waConfig.allowedNumbers.join(",")}]`); return; }
+    if (!allowed) { console.log(`WhatsApp: ${number} not in allowlist [${this.waConfig.allowedNumbers.join(",")}]`); return; }
 
     // Command prefix filter
     if (!text.startsWith(this.waConfig.commandPrefix) && !text.startsWith("@")) return;
 
     const parsed = parseCommand(text, this.waConfig.commandPrefix);
-    waLog(`WhatsApp parsed: type=${parsed.type} command=${(parsed as any).command || "n/a"}`);
-    if (parsed.type === "unknown") { waLog(`WhatsApp: unknown command, ignoring`); return; }
+    console.log(`WhatsApp parsed: type=${parsed.type} command=${(parsed as any).command || "n/a"}`);
+    if (parsed.type === "unknown") { console.log(`WhatsApp: unknown command, ignoring`); return; }
 
     this.messageHandler({
       type: "whatsapp-command",

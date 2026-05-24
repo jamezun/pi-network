@@ -1,6 +1,3 @@
-import { appendFileSync } from "fs";
-const WA_LOG = process.env.HOME + "/.pi/agent/intercom/wa-transport.log";
-function waLog(m: string) { appendFileSync(WA_LOG, "[" + new Date().toISOString() + "] " + m + "\n"); }
 // Pi Network — WhatsApp bridge service
 // Phase 2.4: Core loop connecting WhatsApp to the mesh network.
 // Receives WhatsApp messages → filters → parses → routes → returns results.
@@ -76,7 +73,7 @@ export class WhatsAppBridge {
     this.waTransport.onMessage((msg) => this.handleInboundMessage(msg));
     await this.waTransport.start();
 
-    waLog("WhatsApp bridge started");
+    console.log("WhatsApp bridge started");
   }
 
   async stop(): Promise<void> {
@@ -88,7 +85,7 @@ export class WhatsAppBridge {
   }
 
   private async handleInboundMessage(msg: any): Promise<void> {
-    waLog(`WhatsAppBridge.handleInboundMessage: type=${msg.type} from=${msg.from}`);
+    console.log(`WhatsAppBridge.handleInboundMessage: type=${msg.type} from=${msg.from}`);
     if (msg.type !== "whatsapp-command") return;
 
     // Security check
@@ -99,13 +96,13 @@ export class WhatsAppBridge {
     });
 
     if (!securityResult.allowed) {
-      waLog(`WhatsAppBridge: security blocked ${msg.from}: ${securityResult.reason}`);
+      console.log(`WhatsAppBridge: security blocked ${msg.from}: ${securityResult.reason}`);
       this.security.logCommand(msg.from, msg.raw, `blocked: ${securityResult.reason}`);
       return;
     }
 
     const parsed: ParsedCommand = msg.parsed;
-    waLog(`WhatsAppBridge: routing parsed.type=${parsed.type}`);
+    console.log(`WhatsAppBridge: routing parsed.type=${parsed.type}`);
 
     try {
       switch (parsed.type) {
@@ -267,7 +264,7 @@ export class WhatsAppBridge {
   }
 
   private async sendReply(from: string, text: string): Promise<void> {
-    waLog(`WhatsAppBridge.sendReply: to=${from} text=${text.substring(0, 50)}`);
+    console.log(`WhatsAppBridge.sendReply: to=${from} text=${text.substring(0, 50)}`);
     // Route through WhatsApp transport
     try {
       const res = await fetch(`${this.waConfig.evolutionApiUrl}/message/sendText/${this.waConfig.instanceName}`, {
@@ -280,12 +277,12 @@ export class WhatsAppBridge {
       });
       if (!res.ok) {
         const body = await res.text().catch(() => "");
-        waLog(`WhatsAppBridge.sendReply FAILED: ${res.status} ${body}`);
+        console.log(`WhatsAppBridge.sendReply FAILED: ${res.status} ${body}`);
       } else {
-        waLog(`WhatsAppBridge.sendReply: sent successfully`);
+        console.log(`WhatsAppBridge.sendReply: sent successfully`);
       }
     } catch (e: any) {
-      waLog(`WhatsAppBridge.sendReply error: ${e.message}`);
+      console.log(`WhatsAppBridge.sendReply error: ${e.message}`);
     }
   }
 
