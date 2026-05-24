@@ -28,7 +28,7 @@ export interface ServerConfig {
 export interface BridgeConfig {
   localName: string;
   bridgePort: number;
-  role: AgentRole;
+  role?: AgentRole;  // Optional — roles are dynamic per-task
   capabilities: string[];
   specialties: string[];
   manages: string[];
@@ -123,7 +123,7 @@ export function loadConfig(): BridgeConfig {
   const config: BridgeConfig = {
     localName: raw.localName || "unknown",
     bridgePort: raw.bridgePort || 9764,
-    role: raw.role || "worker",
+    role: raw.role || undefined,
     capabilities: raw.capabilities || [],
     specialties: raw.specialties || [],
     manages: raw.manages || [],

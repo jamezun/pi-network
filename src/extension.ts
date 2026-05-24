@@ -145,6 +145,14 @@ function formatSessionLabel(session: { name?: string; id: string }, dupes: Set<s
   return dupes.has(session.name.toLowerCase()) ? `${session.name} (${shortSessionId(session.id)})` : session.name;
 }
 
+function detectRuntime(): "pi" | "claude" | "unknown" {
+  // Check if we're running inside pi or claude code
+  if (process.env.CLAUDE_CODE_SESSION) return "claude";
+  if (process.env.PI_SESSION || process.env.PI_CWD) return "pi";
+  // Heuristic: pi extensions have pi.getSessionName
+  return "pi"; // We're loaded as a pi extension, so default to pi
+}
+
 function previewText(value: unknown, maxLen = 72): string | undefined {
   if (typeof value !== "string") return undefined;
   const n = value.replace(/\s+/g, " ").trim();
@@ -211,7 +219,9 @@ async function ensureBrokerConnected(reason: "startup" | "background" | "tool" |
         localName: config.localName,                     // Machine identity for routing
         cwd: ctx.cwd, model: currentModel, pid: process.pid,
         startedAt: sessionStartedAt!, lastActivity: Date.now(),
-        status: presenceManager.formatState(), role: config.role,
+        status: presenceManager.formatState(),
+        runtime: detectRuntime(),                        // pi vs claude
+        // Role is dynamic — set per-task by who delegates. No static role.
         capabilities: config.capabilities, specialties: config.specialties,
         color: config.color, purpose: config.purpose, project: config.project,
       });
@@ -1392,10 +1402,10 @@ export default function extension(api: ExtensionAPI) {
         if (others.length === 0) lines.push("No other sessions online.");
         for (const s of others) {
           const icon = s.status === "online" || s.status === "idle" ? "🟢" : s.status === "busy" ? "🟡" : "🔴";
-          const role = s.role || "unknown";
-          const caps = s.capabilities?.join(", ") || "";
+          const rt = s.runtime === "claude" ? "claude" : s.runtime === "pi" ? "pi" : "?";
+          const caps = s.capabilities?.length ? s.capabilities.join(", ") : "";
           const ctx = s.contextUsedPct != null ? ` ${buildCtxBar(s.contextUsedPct, null)}` : "";
-          lines.push(`${icon} **${s.name || s.id.slice(0, 8)}** (${role})${caps ? ` — ${caps}` : ""}${ctx}`);
+          lines.push(`${icon} **${s.name || s.id.slice(0, 8)}** [${rt}]${caps ? ` — ${caps}` : ""}${ctx}`);
         }
       } else {
         // Fall back to file-based registry
@@ -1403,7 +1413,7 @@ export default function extension(api: ExtensionAPI) {
           if (agent.name === config.localName) continue;
           const icon = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : agent.status === "unresponsive" ? "🟠" : "🔴";
           const ctxBar = agent.contextUsedPct != null ? ` ${buildCtxBar(agent.contextUsedPct, null)}` : "";
-          lines.push(`${icon} **${agent.name}** (${agent.role}) — ${agent.capabilities.join(", ")}${ctxBar}`);
+          lines.push(`${icon} **${agent.name}**${ctxBar}`);
         }
       }
       return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -1722,7 +1732,7 @@ export default function extension(api: ExtensionAPI) {
             content: [{ type: "text", text: 
               `Connected: ${connected ? `Yes (${currentSessionId?.slice(0, 8)})` : "No"}\n` +
               `Session: ${pi.getSessionName?.() || config.localName}\n` +
-              `Role: ${config.role}\n` +
+              `Runtime: ${detectRuntime()}\n` +
               `Peers: ${others.length > 0 ? others.map(s => s.name || s.id.slice(0, 8)).join(", ") : "none"}\n` +
               `Pending asks: ${pending.length}${pending.length > 0 ? "\n" + pending.map(p => `  • ${p.from.name}: ${p.message.content.text.slice(0, 60)}...`).join("\n") : ""}`
             }],
@@ -2284,7 +2294,30 @@ export default function extension(api: ExtensionAPI) {
     description: "Network operations: status, send (compose message to peer), manage peers. Flags: --all, --project=NAME, --prune",
     async execute(args, ctx) {
       const parts = (args || "").trim().split(/\s+/);
-      const subcommand = parts[0];
+      const subcommand = parts[0] || "status";
+
+      // /network status → show peers and connection info
+      if (subcommand === "status" || !subcommand) {
+        let sessions: any[] = [];
+        try { if (brokerClient?.isConnected()) sessions = await brokerClient.listSessions(); } catch {}
+        const others = sessions.filter(s => s.id !== currentSessionId);
+        const me = sessions.find(s => s.id === currentSessionId);
+        let status = `📡 **Network Status**\n`;
+        status += `You: **${me?.name || pi.getSessionName?.() || config.localName}** [${detectRuntime()}]\n`;
+        status += `Broker: ${brokerClient?.isConnected() ? "connected" : "disconnected"}\n`;
+        if (others.length > 0) {
+          status += `\nPeers:\n`;
+          for (const s of others) {
+            const icon = s.status === "online" || s.status === "idle" ? "🟢" : s.status === "busy" ? "🟡" : "🔴";
+            const rt = s.runtime === "claude" ? "claude" : s.runtime === "pi" ? "pi" : "?";
+            status += `${icon} ${s.name || s.id.slice(0, 8)} [${rt}]\n`;
+          }
+        } else {
+          status += `No other sessions.\n`;
+        }
+        ctx.ui.notify(status, "info");
+        return;
+      }
 
       // /network send → pick peer and compose message
       if (subcommand === "send") {

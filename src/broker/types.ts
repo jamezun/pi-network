@@ -10,12 +10,14 @@ export interface SessionInfo {
   startedAt: number;
   lastActivity: number;
   status?: string;
-  role?: "manager" | "worker";
+  runtime?: "pi" | "claude" | "unknown";  // What agent is driving this session
+  role?: string;  // Dynamic — determined by task delegation, not config
   capabilities?: string[];
   specialties?: string[];
   color?: string;
   purpose?: string;
   project?: string;
+  localName?: string;  // Machine identity for routing
 }
 
 export interface BrokerMessage {
