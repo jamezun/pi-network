@@ -414,29 +414,32 @@ function refreshAgentsFromBroker() {
         const peerCfg = configPeers[peerName];
         if (!peerCfg?.host) return null;
         const port = peerCfg.bridgePort || config.bridgePort;
-        const url = `http://${peerCfg.host}:${port}/ping`;
+        const baseUrl = `http://${peerCfg.host}:${port}`;
         try {
-          const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+          // Use /status for rich info (sessionName, model, status), fallback /ping
+          const res = await fetch(`${baseUrl}/status`, { signal: AbortSignal.timeout(3000) });
           const data = await res.json();
-          if (data.pong) {
-            return {
-              name: peerName,
-              status: "online" as const,
-              rawStatus: "online",
-              role: "worker" as const,
-              runtime: "pi" as const,
-              capabilities: [] as string[],
-              specialties: [] as string[],
-              sessionName: data.name || peerName,
-              heartbeatAt: Date.now(),
-              staleCount: 0,
-              remote: true,
-              host: peerCfg.host,
-              bridgePort: port,
-            };
-          }
+          const displayName = data.sessionName || data.name || peerName;
+          return {
+            name: displayName,
+            status: data.online ? "online" as const : "offline" as const,
+            rawStatus: data.status || "online",
+            role: "worker" as const,
+            runtime: "pi" as const,
+            capabilities: [] as string[],
+            specialties: [] as string[],
+            sessionName: displayName,
+            model: data.model,
+            cwd: data.cwd || "",
+            heartbeatAt: Date.now(),
+            staleCount: 0,
+            remote: true,
+            configName: peerName,
+            host: peerCfg.host,
+            bridgePort: port,
+          };
         } catch {}
-        // Offline peer — still show as offline
+        // Offline peer — show config name with offline status
         return {
           name: peerName,
           status: "offline" as const,
@@ -449,6 +452,7 @@ function refreshAgentsFromBroker() {
           heartbeatAt: 0,
           staleCount: 0,
           remote: true,
+          configName: peerName,
           host: peerCfg.host,
           bridgePort: peerCfg.bridgePort || config.bridgePort,
         };
