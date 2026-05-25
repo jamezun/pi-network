@@ -2768,30 +2768,21 @@ export default function extension(api: ExtensionAPI) {
       const parts = (args || "").trim().split(/\s+/);
       const subcommand = parts[0] || "status";
 
-      // /network status → show peers and connection info
+      // /network status → show peers from agents[] (single source of truth)
       if (subcommand === "status" || !subcommand) {
-        // Collect pi sessions from broker
-        let piSessions: any[] = [];
-        try { if (brokerClient?.isConnected()) piSessions = await brokerClient.listSessions(); } catch(_e) {}
-        const others = piSessions.filter((s: any) => s.id !== currentSessionId);
-        const me = piSessions.find((s: any) => s.id === currentSessionId);
-        // Collect Claude sessions from ~/.claude/sessions/
-        const claudeSessions = discoverClaudeSessions();
+        const myName = pi.getSessionName?.() || config.localName;
         let status = `📡 **Network Status**\n`;
-        status += `You: **${me?.name || pi.getSessionName?.() || config.localName}** [${detectRuntime()}]\n`;
+        status += `You: **${myName}** [${detectRuntime()}]\n`;
         status += `Broker: ${brokerClient?.isConnected() ? "connected" : "disconnected"}\n`;
-        if (others.length > 0 || claudeSessions.length > 0) {
-          status += `\nPeers:\n`;
-          for (const s of others) {
-            const icon = (s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("🟢")) ? "🟢" : (s.status?.includes("busy") || s.status?.includes("tool:")) ? "🟡" : "🔴";
-            const rt = s.runtime === "claude" ? "claude" : s.runtime === "pi" ? "pi" : "?";
-            const model = (s.model || "?").replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
-            status += `${icon} ${s.name || s.id.slice(0, 8)} [${rt}] ${model}\n`;
-          }
-          for (const s of claudeSessions) {
-            const icon = s.status === "idle" || s.status === "online" ? "🟢" : "🟡";
-            const model = (s.model || "claude").replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
-            status += `${icon} ${s.name} [claude] ${model}\n`;
+        const otherAgents = agents.filter((a: any) => a.name !== myName);
+        if (otherAgents.length > 0) {
+          status += `\nPeers (${otherAgents.length}):\n`;
+          for (const a of otherAgents) {
+            const icon = a.status === "offline" ? "🔴" : a.status === "busy" ? "🟡" : "🟢";
+            const rt = a.runtime || "pi";
+            const model = (a.model || "?").replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
+            const remote = (a as any).remote ? " (remote)" : "";
+            status += `${icon} ${a.name} [${rt}] ${model}${remote}\n`;
           }
         } else {
           status += `No other sessions.\n`;
