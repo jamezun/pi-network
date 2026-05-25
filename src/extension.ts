@@ -320,6 +320,46 @@ function debouncedRefresh() {
   refreshAgentsFromBroker();
 }
 
+/** Scan JSONL session files for session_info name changes.
+ *  Returns map: oldName (lowercase) → currentName */
+function buildRenameMap(): Map<string, string> {
+  const renameMap = new Map<string, string>();
+  try {
+    const sessionsDir = require("path").join(require("os").homedir(), ".pi/agent/sessions");
+    const now = Date.now();
+    const {readdirSync, readFileSync, statSync} = require("fs");
+    for (const proj of readdirSync(sessionsDir, {withFileTypes:true})) {
+      if (!proj.isDirectory()) continue;
+      for (const f of readdirSync(require("path").join(sessionsDir, proj.name))) {
+        if (!f.endsWith(".jsonl")) continue;
+        const fp = require("path").join(sessionsDir, proj.name, f);
+        const stat = statSync(fp);
+        if (now - stat.mtimeMs > 4 * 60 * 60 * 1000) continue;  // Only recent files
+        try {
+          const lines = readFileSync(fp, "utf8").split("\n").filter((l:string) => l.trim());
+          const names: string[] = [];
+          for (const line of lines) {
+            try {
+              const e = JSON.parse(line);
+              if (e.type === "session_info" && e.name) names.push(e.name);
+            } catch {}
+          }
+          // If last name differs from earlier names, map old → new
+          if (names.length > 1) {
+            const current = names[names.length - 1];
+            for (const old of names.slice(0, -1)) {
+              if (old.toLowerCase() !== current.toLowerCase()) {
+                renameMap.set(old.toLowerCase(), current);
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+  return renameMap;
+}
+
 function refreshAgentsFromBroker() {
   const myName = pi.getSessionName?.() || "";
 
@@ -344,14 +384,40 @@ function refreshAgentsFromBroker() {
         startedAt: s.startedAt,
       }));
 
+    // ── 1b. Enrich broker agents with current session names from JSONL ──
+    //    When a session is renamed (e.g. 8496 → 84XX), broker keeps old name.
+    //    Match by cwd: find the most recently modified JSONL in the broker session's project dir.
+    const activePiSessions = discoverActivePiSessions();
+    for (const ba of brokerAgents) {
+      if (!ba.cwd) continue;
+      // Find active pi sessions in the same project directory
+      const matching = activePiSessions.filter(s =>
+        s.name.toLowerCase() !== ba.name.toLowerCase() &&
+        s.startedAt > (ba.startedAt || 0) - 60000  // Same approximate time window
+      );
+      // If only one pi session exists with a different name, it's likely a rename
+      // Better: check if ba.name appears as an old name in ANY JSONL that now has a different name
+    }
+    // Build old→new name map from JSONL session_info chains
+    const renameMap = buildRenameMap();
+    for (const ba of brokerAgents) {
+      const newName = renameMap.get(ba.name.toLowerCase());
+      if (newName) {
+        debugLog("renamed: " + ba.name + " -> " + newName);
+        ba.name = newName;
+        ba.sessionName = newName;
+      }
+    }
+
     // ── 2. Active Pi sessions from JSONL (same source as /resume) ──
     //    Catches sessions that lost broker connection.
     const brokerNames = new Set<string>();
-    for (const s of brokerAgents) brokerNames.add(s.name.toLowerCase());
-    const activePiSessions = discoverActivePiSessions();
+    const brokerPids = new Set<number>();
+    for (const s of brokerAgents) { brokerNames.add(s.name.toLowerCase()); if (s.pid) brokerPids.add(s.pid); }
     const orphanSessions = activePiSessions.filter(s =>
       s.name.toLowerCase() !== myName.toLowerCase() &&
-      !brokerNames.has(s.name.toLowerCase())
+      !brokerNames.has(s.name.toLowerCase()) &&
+      !(s.pid && brokerPids.has(s.pid))
     );
     if (orphanSessions.length > 0) {
       debugLog(`orphan sessions from JSONL: ${orphanSessions.map(s => s.name).join(", ")}`);
@@ -745,7 +811,7 @@ function startHeartbeat() {
       if (brokerClient?.isConnected()) {
         const pUpdate = presenceManager.updateContext(Math.round(contextPct), concurrency.getQueueLength(), concurrency.getRunningCount());
         pUpdate.agent = config.localName;
-        brokerClient.updatePresence({ status: presenceManager.formatState(), model: currentModel });
+        brokerClient.updatePresence({ status: presenceManager.formatState(), model: currentModel, name: pi.getSessionName?.() || config.localName });
       }
       // Refresh agents from broker (debounced)
       debouncedRefresh();
@@ -868,7 +934,7 @@ export default function extension(api: ExtensionAPI) {
     currentSessionId = ctx.sessionManager.getSessionId();
     currentModel = ctx.model?.id ?? "unknown";
     // Push model change to broker immediately
-    if (brokerClient?.isConnected()) brokerClient.updatePresence({ model: currentModel });
+    if (brokerClient?.isConnected()) brokerClient.updatePresence({ model: currentModel, name: pi.getSessionName?.() || config.localName });
     sessionStartedAt = Date.now();
 
     // Apply CLI flag overrides
@@ -1116,7 +1182,7 @@ export default function extension(api: ExtensionAPI) {
   pi.on("before_agent_start", async (event, _ctx) => {
     // Phase 1.8: Mark agent as thinking
     presenceManager.setThinking();
-    if (brokerClient) brokerClient.updatePresence({ status: "thinking", model: currentModel });
+    if (brokerClient) brokerClient.updatePresence({ status: "thinking", model: currentModel, name: pi.getSessionName?.() || config.localName });
 
     const tailnet = mode === "tailscale" || mode === "hybrid" ? getTailnetPeers() : null;
     const prompt = buildAgentPrompt(agents, config, mode, concurrency, localStatus, tailnet || undefined);
@@ -1150,7 +1216,7 @@ export default function extension(api: ExtensionAPI) {
 
     // Phase 1.8: Tool-level presence
     presenceManager.setToolExecuting(event.toolName);
-    if (brokerClient) brokerClient.updatePresence({ status: `tool:${event.toolName}`, model: currentModel });
+    if (brokerClient) brokerClient.updatePresence({ status: `tool:${event.toolName}`, model: currentModel, name: pi.getSessionName?.() || config.localName });
 
     // 2. File lock check for write/edit
     if (!["write", "edit"].includes(event.toolName)) return;
@@ -1255,7 +1321,7 @@ export default function extension(api: ExtensionAPI) {
 
     // Phase 1.2: Idle-aware delivery — flush queued messages when agent is idle
     presenceManager.setIdle();
-    if (brokerClient) brokerClient.updatePresence({ status: "idle", model: currentModel });
+    if (brokerClient) brokerClient.updatePresence({ status: "idle", model: currentModel, name: pi.getSessionName?.() || config.localName });
     if (idleQueue.length > 0) {
       idleQueue.sortByPriority();
       const pending = idleQueue.dequeueAll();
