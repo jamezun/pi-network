@@ -399,8 +399,10 @@ function refreshAgentsFromBroker() {
         startedAt: s.startedAt,
       }));
 
-    // ── Merge by name (dedup) ──
-    agents = [...brokerAgents, ...orphanAgents, ...claudeAgents];
+    // ── Merge by name (dedup), preserve remote peers ──
+    // Keep existing remote peers so async refreshRemotePeers() updates don't get wiped
+    const existingRemote = agents.filter(a => (a as any).remote);
+    agents = [...brokerAgents, ...orphanAgents, ...claudeAgents, ...existingRemote];
 
     const ctx = getLiveContext();
     if (ctx) {
