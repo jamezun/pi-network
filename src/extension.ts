@@ -2793,6 +2793,9 @@ export default function extension(api: ExtensionAPI) {
 
       // /network status → show peers from agents[] (single source of truth)
       if (subcommand === "status" || !subcommand) {
+        // Force refresh for instant data
+        refreshAgentsFromBroker();
+        refreshRemotePeers();
         const myName = pi.getSessionName?.() || config.localName;
         let status = `📡 **Network Status**\n`;
         status += `You: **${myName}** [${detectRuntime()}]\n`;
@@ -2826,7 +2829,7 @@ export default function extension(api: ExtensionAPI) {
         } else {
           showPeersInFooter = !showPeersInFooter;
           if (!showPeersInFooter) ctx.ui.setStatus("bridge", undefined as any);
-          else refreshAgentsFromBroker();
+          else { refreshAgentsFromBroker(); refreshRemotePeers(); }
           ctx.ui.notify("🌐 Peers: " + (showPeersInFooter ? peerLayout : "OFF"), "info");
         }
         return;
