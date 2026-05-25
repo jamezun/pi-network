@@ -400,9 +400,10 @@ function refreshAgentsFromBroker() {
       }));
 
     // ── Merge by name (dedup), preserve remote peers ──
-    // Keep existing remote peers so async refreshRemotePeers() updates don't get wiped
+    // Keep existing remote peers + synthetic WhatsApp peer so they don't get wiped
     const existingRemote = agents.filter(a => (a as any).remote);
-    agents = [...brokerAgents, ...orphanAgents, ...claudeAgents, ...existingRemote];
+    const existingSynthetic = agents.filter(a => (a as any).runtime === "whatsapp");
+    agents = [...brokerAgents, ...orphanAgents, ...claudeAgents, ...existingRemote, ...existingSynthetic];
 
     const ctx = getLiveContext();
     if (ctx) {
@@ -952,6 +953,28 @@ export default function extension(api: ExtensionAPI) {
         await whatsappBridge.start();
         ctx.ui.notify("📱 WhatsApp bridge started", "info");
         debugLog("whatsapp bridge started successfully");
+        // Add WhatsApp synthetic peer (always online)
+        const waCfg2 = (config as any)?.whatsapp;
+        const waNumbers = waCfg2?.allowedNumbers || [];
+        const waContact = waNumbers.length > 1 ? waNumbers[waNumbers.length - 1] : (waNumbers[0] || "");
+        if (waContact) {
+          const formatted = waContact.replace(/(\d{3})(\d{4,})/, "$1-$2");
+          const existingWa = agents.findIndex(a => (a as any).runtime === "whatsapp");
+          const waPeer: any = {
+            name: formatted,
+            status: "online" as const,
+            rawStatus: "📱 connected",
+            runtime: "whatsapp",
+            capabilities: ["messaging", "files"],
+            specialties: ["messaging"],
+            sessionName: formatted,
+            model: undefined,
+            heartbeatAt: Date.now(),
+            staleCount: 0,
+          };
+          if (existingWa >= 0) agents[existingWa] = waPeer;
+          else agents.push(waPeer);
+        }
       }
     } catch (e: any) {
       debugLog(`whatsapp bridge FAILED: ${e.message}`);
