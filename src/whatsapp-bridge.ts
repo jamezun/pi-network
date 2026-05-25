@@ -228,12 +228,28 @@ export class WhatsAppBridge {
       userId: from,
     };
 
-    const result = await this.meshTransport.send(parsed.peer, envelope);
-    if (result.delivered) {
-      await this.sendReply(from, `📤 Task sent to ${parsed.peer}. Result will follow.`);
-    } else {
-      await this.sendReply(from, formatOfflinePeer(parsed.peer));
-    }
+    // Try broker delivery first (local sessions), then HTTP transport (remote)
+        let result: { delivered: boolean; queued?: boolean };
+        try {
+          if (this.brokerClient && this.brokerClient.isConnected()) {
+            const brokerResult = await this.brokerClient.send(parsed.peer, { text: parsed.task, expectsReply: true, taskId: envelope.taskId });
+            result = { delivered: brokerResult?.delivered ?? true, queued: false };
+          } else {
+            result = await this.meshTransport.send(parsed.peer, envelope);
+          }
+        } catch {
+          try {
+            result = await this.meshTransport.send(parsed.peer, envelope);
+          } catch (e: any) {
+            await this.sendReply(from, formatError("Failed to deliver: " + e.message));
+            return;
+          }
+        }
+        if (result.delivered) {
+          await this.sendReply(from, `📤 Task sent to ${parsed.peer}. Result will follow.`);
+        } else {
+          await this.sendReply(from, formatOfflinePeer(parsed.peer));
+        }
   }
 
   private async handleBroadcast(from: string, jid: string, parsed: ParsedCommand): Promise<void> {

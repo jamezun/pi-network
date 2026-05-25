@@ -578,6 +578,8 @@ function refreshRemotePeers() {
         } else if (!agents.some(a => a.name.toLowerCase() === rs.name.toLowerCase())) {
           agents.push(agent);
         }
+        // Register host for transport routing (session name -> host:port)
+        if (host) registerPeerHost(rs.name, host, bridgePort);
       }
 
       // Remove stale remote agents from this machine
