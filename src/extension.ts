@@ -229,7 +229,7 @@ async function ensureBrokerConnected(reason: "startup" | "background" | "tool" |
       await nextClient.connect({
         name: pi.getSessionName?.() || `${config.localName}:${process.pid}`, // Real session name for discovery
         localName: config.localName,                     // Machine identity for routing
-        cwd: ctx.cwd, model: currentModel, pid: process.pid,
+        cwd: ctx.cwd, model: normalizeModel(currentModel), pid: process.pid,
         startedAt: sessionStartedAt!, lastActivity: Date.now(),
         status: presenceManager.formatState(),
         runtime: detectRuntime(),                        // pi vs claude
@@ -444,7 +444,7 @@ function refreshAgentsFromBroker() {
     for (const ba of brokerAgents) {
       if (ba.pid && claudeByPid.has(ba.pid)) {
         const cs = claudeByPid.get(ba.pid)!;
-        if (cs.model) ba.model = cs.model;  // Real model from transcript (e.g. claude-haiku-4-5)
+        if (cs.model) ba.model = normalizeModel(cs.model);  // Real model from transcript
         if (cs.name && !ba.name.startsWith(cs.name)) ba.sessionName = cs.name;  // Real name ("Hendry" not "Claude: Hendry")
         ba.runtime = "claude";
       }
@@ -677,7 +677,7 @@ function startLocalBridge(port: number) {
         activeTaskCount: concurrency.getRunningCount(),
         maxConcurrentTasks: config.maxConcurrentTasks,
         contextUsedPct: localEntry?.contextUsedPct ?? 0,
-        model: currentModel,
+        model: normalizeModel(currentModel),
         color: config.color,
         purpose: config.purpose,
         sessions: allSessions,
@@ -811,7 +811,7 @@ function startHeartbeat() {
       if (brokerClient?.isConnected()) {
         const pUpdate = presenceManager.updateContext(Math.round(contextPct), concurrency.getQueueLength(), concurrency.getRunningCount());
         pUpdate.agent = config.localName;
-        brokerClient.updatePresence({ status: presenceManager.formatState(), model: currentModel, name: pi.getSessionName?.() || config.localName });
+        brokerClient.updatePresence({ status: presenceManager.formatState(), model: normalizeModel(currentModel), name: pi.getSessionName?.() || config.localName });
       }
       // Refresh agents from broker (debounced)
       debouncedRefresh();
@@ -934,7 +934,7 @@ export default function extension(api: ExtensionAPI) {
     currentSessionId = ctx.sessionManager.getSessionId();
     currentModel = ctx.model?.id ?? "unknown";
     // Push model change to broker immediately
-    if (brokerClient?.isConnected()) brokerClient.updatePresence({ model: currentModel, name: pi.getSessionName?.() || config.localName });
+    if (brokerClient?.isConnected()) brokerClient.updatePresence({ model: normalizeModel(currentModel), name: pi.getSessionName?.() || config.localName });
     sessionStartedAt = Date.now();
 
     // Apply CLI flag overrides
@@ -1182,7 +1182,7 @@ export default function extension(api: ExtensionAPI) {
   pi.on("before_agent_start", async (event, _ctx) => {
     // Phase 1.8: Mark agent as thinking
     presenceManager.setThinking();
-    if (brokerClient) brokerClient.updatePresence({ status: "thinking", model: currentModel, name: pi.getSessionName?.() || config.localName });
+    if (brokerClient) brokerClient.updatePresence({ status: "thinking", model: normalizeModel(currentModel), name: pi.getSessionName?.() || config.localName });
 
     const tailnet = mode === "tailscale" || mode === "hybrid" ? getTailnetPeers() : null;
     const prompt = buildAgentPrompt(agents, config, mode, concurrency, localStatus, tailnet || undefined);
@@ -1216,7 +1216,7 @@ export default function extension(api: ExtensionAPI) {
 
     // Phase 1.8: Tool-level presence
     presenceManager.setToolExecuting(event.toolName);
-    if (brokerClient) brokerClient.updatePresence({ status: `tool:${event.toolName}`, model: currentModel, name: pi.getSessionName?.() || config.localName });
+    if (brokerClient) brokerClient.updatePresence({ status: `tool:${event.toolName}`, model: normalizeModel(currentModel), name: pi.getSessionName?.() || config.localName });
 
     // 2. File lock check for write/edit
     if (!["write", "edit"].includes(event.toolName)) return;
@@ -1321,7 +1321,7 @@ export default function extension(api: ExtensionAPI) {
 
     // Phase 1.2: Idle-aware delivery — flush queued messages when agent is idle
     presenceManager.setIdle();
-    if (brokerClient) brokerClient.updatePresence({ status: "idle", model: currentModel, name: pi.getSessionName?.() || config.localName });
+    if (brokerClient) brokerClient.updatePresence({ status: "idle", model: normalizeModel(currentModel), name: pi.getSessionName?.() || config.localName });
     if (idleQueue.length > 0) {
       idleQueue.sortByPriority();
       const pending = idleQueue.dequeueAll();
@@ -3156,11 +3156,18 @@ function hexFg(hex: string, s: string): string {
   return `\x1b[38;2;${parseInt(m[1], 16)};${parseInt(m[2], 16)};${parseInt(m[3], 16)}m${s}\x1b[39m`;
 }
 
+/** Normalize model name: strip provider prefix, remove duplicates like deepseek/deepseek */
+function normalizeModel(model: string): string {
+  if (!model) return "";
+  // Strip known provider prefixes
+  let m = model.replace(/^(anthropic|openai|google|x-ai|meta-llama|meta|deepseek|zhipu|z-ai)\//, "");
+  // Remove duplicate prefix (e.g. deepseek-v4-pro from deepseek/deepseek-v4-pro is fine)
+  // But "deepseek/deepseek-v4-pro" → "deepseek-v4-pro" (already handled by strip above)
+  return m || model;
+}
+
 function abbreviateModel(model: string): string {
-  if (model.includes("claude")) return model.replace(/.*claude-/, "claude-");
-  if (model.includes("gpt")) return model.replace(/.*gpt-/, "gpt-");
-  if (model.includes("deepseek")) return "deepseek";
-  return model.length > 20 ? model.slice(0, 18) + "…" : model;
+  return normalizeModel(model);
 }
 
 function buildCtxBar(pct: number, theme: any): string {
