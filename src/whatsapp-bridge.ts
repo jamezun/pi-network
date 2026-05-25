@@ -47,7 +47,7 @@ export class WhatsAppBridge {
   private getAgents(): any[] {
     const live = this.getLiveAgents?.();
     if (live && live.length > 0) return live;
-    return this.getAgents();
+    return [];  // No live agents available
   }
 
   /** Get online agent names for peer matching */
@@ -57,7 +57,7 @@ export class WhatsAppBridge {
       .map(a => a.name);
   }
 
-  constructor(config: BridgeConfig, transport: Transport, private getLiveAgents?: () => any[]) {
+  constructor(config: BridgeConfig, transport: Transport, private getLiveAgents?: () => any[], private brokerClient?: any) {
     this.config = config;
     this.waConfig = (config as any).whatsapp as WhatsAppBridgeConfig;
     this.meshTransport = transport;

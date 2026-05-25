@@ -949,7 +949,7 @@ export default function extension(api: ExtensionAPI) {
       const waCfg = (config as any).whatsapp;
       debugLog(`whatsapp config: enabled=${waCfg?.enabled}, url=${waCfg?.evolutionApiUrl}`);
       if (waCfg?.enabled) {
-        whatsappBridge = new WhatsAppBridge(config, transport, () => agents);
+        whatsappBridge = new WhatsAppBridge(config, transport, () => agents, brokerClient);
         await whatsappBridge.start();
         ctx.ui.notify("📱 WhatsApp bridge started", "info");
         debugLog("whatsapp bridge started successfully");
