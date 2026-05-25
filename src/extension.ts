@@ -48,10 +48,10 @@ import { withinHopLimit, stampHop } from "./core/hop-limit";
 import { appendAudit, formatAudit, readAudit } from "./core/audit";
 import { evaluateToolCall, formatBlockMessage, formatAskMessage, loadRules } from "./core/damage-control";
 import type { DamageControlRules } from "./core/damage-control";
-import { loadPersonaFiles } from "./core/personas";
+
 import { BrokerClient } from "./broker/client";
 import { spawnBrokerIfNeeded } from "./broker/spawn";
-import { discoverClaudeSessions } from "./core/claude-discovery";
+import { discoverActivePiSessions, discoverClaudeSessions } from "./core/pi-discovery";
 import { IdleQueue } from "./core/idle-queue";
 import { loadConfirmConfig, shouldConfirm, formatConfirmPrompt } from "./core/confirm-send";
 import { PresenceManager } from "./core/presence";
@@ -64,7 +64,7 @@ import { NetworkSettingsOverlay } from "./ui/network-settings";
 import type { NetworkSettings } from "./ui/network-settings";
 import { DEFAULT_SETTINGS } from "./ui/network-settings";
 import { loadNetworkSettings, saveNetworkSettings } from "./core/settings-sync";
-import type { PersonaDef } from "./core/personas";
+
 import { ulid } from "./core/ulid";
 import { GitSyncManager, loadGitSyncConfig } from "./core/git-sync";
 import { validateInterviewRequest, formatInterviewRequest, parseInterviewReply, type InterviewRequest, type InterviewReply } from "./core/interview";
@@ -171,13 +171,13 @@ function getLiveContext(ctx: ExtensionContext | null = runtimeContext, generatio
     if (currentSessionId && ctx.sessionManager.getSessionId() !== currentSessionId) return null;
     void ctx.hasUI;
     return ctx;
-  } catch { return null; }
+  } catch(_e) { return null; }
 }
 
 function notifyIfLive(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error", generation = runtimeGeneration): void {
   const live = getLiveContext(ctx, generation);
   if (!live?.hasUI) return;
-  try { live.ui.notify(message, level); } catch {}
+  try { live.ui.notify(message, level); } catch(_e) {}
 }
 
 function clearReconnectTimer(): void {
@@ -194,13 +194,17 @@ function getReconnectDelayMs(): number {
 function scheduleReconnect(): void {
   if (disposed || shuttingDown || reconnectTimer) return;
   const gen = runtimeGeneration;
+  debugLog(`scheduleReconnect: attempt=${reconnectAttempt}, delay=${getReconnectDelayMs()}ms, gen=${gen}, currentGen=${runtimeGeneration}`);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    if (gen !== runtimeGeneration) return;
+    if (gen !== runtimeGeneration) { debugLog(`scheduleReconnect: gen mismatch, skipping`); return; }
+    debugLog(`scheduleReconnect: firing ensureBrokerConnected`);
     reconnectAttempt++;
-    ensureBrokerConnected("background").catch(() => {});
+    ensureBrokerConnected("background")
+      .then(() => { debugLog(`background reconnect succeeded`); })
+      .catch((e: any) => { debugLog(`background reconnect failed: ${e.message}`); });
   }, getReconnectDelayMs());
-  try { (reconnectTimer as any).unref?.(); } catch {}
+  try { (reconnectTimer as any).unref?.(); } catch(_e) {}
 }
 
 async function ensureBrokerConnected(reason: "startup" | "background" | "tool" | "overlay"): Promise<BrokerClient> {
@@ -216,14 +220,14 @@ async function ensureBrokerConnected(reason: "startup" | "background" | "tool" |
 
   const nextPromise = (async (): Promise<BrokerClient> => {
     // Disconnect any stale broker client first
-    if (brokerClient?.isConnected()) { try { await brokerClient.disconnect(); } catch {} brokerClient = null; }
+    if (brokerClient?.isConnected()) { try { await brokerClient.disconnect(); } catch(_e) {} brokerClient = null; }
     const nextClient = new BrokerClient();
     brokerClient = nextClient;
     attachBrokerClientHandlers(nextClient);
     try {
       await spawnBrokerIfNeeded();
       await nextClient.connect({
-        name: pi.getSessionName?.() || config.localName, // Real session name for discovery
+        name: pi.getSessionName?.() || `${config.localName}:${process.pid}`, // Real session name for discovery
         localName: config.localName,                     // Machine identity for routing
         cwd: ctx.cwd, model: currentModel, pid: process.pid,
         startedAt: sessionStartedAt!, lastActivity: Date.now(),
@@ -264,12 +268,14 @@ function attachBrokerClientHandlers(client: BrokerClient): void {
   });
   client.on("disconnected", () => {
     if (brokerClient !== client) return;
+    debugLog(`broker disconnected! disposed=${disposed} shuttingDown=${shuttingDown} sessionId=${currentSessionId?.slice(0,8)}`);
     // Reject any pending reply waiter
     if (replyWaiter) replyWaiter.reject(new Error("Broker disconnected"));
     brokerClient = null;
     if (!shuttingDown && !disposed) {
       clearReconnectTimer();
       scheduleReconnect();
+      debugLog("scheduleReconnect triggered after broker disconnect");
       const ctx = getLiveContext();
       if (ctx?.hasUI) ctx.ui.notify("⚠️ Broker disconnected, reconnecting...", "warning");
     }
@@ -297,7 +303,7 @@ function attachBrokerClientHandlers(client: BrokerClient): void {
 // Refresh agents array from broker sessions (async, fire-and-forget)
 const DEBUG_LOG = require("os").homedir() + "/.pi/agent/intercom/pi-network-debug.log";
 function debugLog(msg: string) {
-  try { require("fs").appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
+  try { require("fs").appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch(_e) {}
 }
 let showPeersInFooter = true;  // toggle with /network peers
 let peerLayout: "horizontal" | "vertical" = "horizontal";
@@ -315,100 +321,86 @@ function debouncedRefresh() {
 }
 
 function refreshAgentsFromBroker() {
-  // refreshAgentsFromBroker called
+  const myName = pi.getSessionName?.() || "";
+
   const piSessionsPromise = brokerClient?.isConnected()
     ? brokerClient.listSessions().then(s => { return s; }).catch((e: any) => { debugLog(`broker list error: ${e.message}`); return [] as any[]; })
     : Promise.resolve([] as any[]);
 
-  piSessionsPromise.then((piSessions) => {
-    const piAgents = piSessions
+  piSessionsPromise.then((brokerSessions) => {
+    // ── 1. Broker-registered sessions (have PID, can receive tasks) ──
+    const brokerAgents = brokerSessions
       .filter((s: any) => s.id !== currentSessionId)
-      .filter((s: any) => s.status !== "external")  // Skip virtual/bridged Claude sessions (can't handle mesh tasks)
+      .filter((s: any) => s.status !== "external")
       .map((s: any) => ({
         name: s.name || s.id.slice(0, 8),
-        status: s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("\ud83d\udfe2") ? "online" : s.status?.includes("busy") || s.status?.includes("tool:") ? "busy" : "offline",
+        status: s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("\ud83d\udfe2") ? "online" as const : s.status?.includes("busy") || s.status?.includes("tool:") ? "busy" as const : "offline" as const,
         rawStatus: s.status,
-        role: s.role,
         runtime: s.runtime || "pi",
-        capabilities: s.capabilities || [],
-        specialties: s.specialties || [],
         model: s.model,
         pid: s.pid,
-        sessionName: s.name,
         cwd: s.cwd || "",
         heartbeatAt: s.lastActivity,
-        staleCount: 0,
-        contextUsedPct: (s as any).contextUsedPct,
-        color: s.color,
-        project: s.project,
         startedAt: s.startedAt,
       }));
 
-    // Merge Claude sessions discovered from ~/.claude/sessions/
-    // Only include Claude sessions that are also registered with the broker,
-    // since unregistered Claude sessions can't receive mesh messages.
+    // ── 2. Active Pi sessions from JSONL (same source as /resume) ──
+    //    Catches sessions that lost broker connection.
+    const brokerNames = new Set<string>();
+    for (const s of brokerAgents) brokerNames.add(s.name.toLowerCase());
+    const activePiSessions = discoverActivePiSessions();
+    const orphanSessions = activePiSessions.filter(s =>
+      s.name.toLowerCase() !== myName.toLowerCase() &&
+      !brokerNames.has(s.name.toLowerCase())
+    );
+    if (orphanSessions.length > 0) {
+      debugLog(`orphan sessions from JSONL: ${orphanSessions.map(s => s.name).join(", ")}`);
+    }
+    const orphanAgents = orphanSessions.map(s => ({
+      name: s.name,
+      status: "online" as const,
+      rawStatus: "orphan (broker disconnected)",
+      runtime: "pi" as const,
+      model: undefined as string | undefined,
+      pid: undefined as number | undefined,
+      cwd: s.cwd || "",
+      heartbeatAt: Date.now(),
+      startedAt: s.startedAt,
+    }));
+
+    // ── 3. Claude sessions from ~/.claude/sessions/ ──
+    const allPiNames = new Set([...brokerAgents, ...orphanAgents].map(a => a.name.toLowerCase()));
     const claudeSessions = discoverClaudeSessions();
-    const claudeSessionPids = new Set(claudeSessions.map(s => s.pid));
+    const claudeByPid = new Map<number, typeof claudeSessions[0]>();
+    for (const s of claudeSessions) if (s.pid) claudeByPid.set(s.pid, s);
 
-    // Dedupe broker sessions: same name from different session IDs (stale registrations)
-    const seen = new Set<string>();
-    const dedupedPi = piAgents.filter((a: any) => {
-      const key = a.name.toLowerCase();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-    // Only add Claude sessions that are registered with the broker (connected to mesh)
-    // A Claude session registered with the broker has a matching PID in both lists.
-    const piPids = new Set(dedupedPi.filter((a: any) => a.pid).map((a: any) => a.pid));
-    const uniqueClaude = claudeSessions
-      .filter(s => !piPids.has(s.pid))  // Not already in broker as a pi session
-      .filter(s => {
-        // Only include if the broker also knows about this Claude session
-        // (i.e., claude-bridge registered it). Check by matching PID in broker sessions.
-        const brokerPidMatch = piSessions.some((bs: any) => bs.pid === s.pid);
-        return brokerPidMatch;
-      })
-      .map(s => ({
-        name: s.name,
-        status: s.status === "idle" ? "online" : s.status === "busy" ? "busy" : "online",
-        rawStatus: s.status,
-        runtime: "claude" as const,
-        capabilities: [] as string[],
-        specialties: [] as string[],
-        model: s.model,
-        pid: s.pid,
-        sessionName: s.name,
-        cwd: s.cwd || "",
-        heartbeatAt: Date.now(),
-        staleCount: 0,
-        startedAt: s.startedAt,
-      }));
-
-    agents = [...dedupedPi, ...uniqueClaude];
-
-    // Add WhatsApp number as a synthetic peer (receive-only, no work)
-    const waCfg = (config as any)?.whatsapp;
-    if (waCfg?.enabled && waCfg?.allowedNumbers?.length > 0) {
-      const waNumber = waCfg.allowedNumbers.length > 1 ? waCfg.allowedNumbers[waCfg.allowedNumbers.length - 1] : waCfg.allowedNumbers[0];
-      const formatted = `+${waNumber.slice(0,3)}-${waNumber.slice(3)}`;
-      // Don't add duplicate if somehow already present
-      if (!agents.some(a => a.name === `📱${formatted}`)) {
-        agents.push({
-          name: `📱${formatted}`,
-          role: "worker" as const,
-          status: "online" as const,
-          lastSeen: Date.now(),
-          capabilities: ["receive-message"],
-          specialties: [],
-          manages: [],
-          reportTo: null,
-          runtime: "whatsapp",
-          model: undefined,
-        } as any);
+    // Enrich broker agents that are Claude sessions with real model from transcript
+    for (const ba of brokerAgents) {
+      if (ba.pid && claudeByPid.has(ba.pid)) {
+        const cs = claudeByPid.get(ba.pid)!;
+        if (cs.model) ba.model = cs.model;  // Real model from transcript (e.g. claude-haiku-4-5)
+        if (cs.name && !ba.name.startsWith(cs.name)) ba.sessionName = cs.name;  // Real name ("Hendry" not "Claude: Hendry")
+        ba.runtime = "claude";
       }
     }
+
+    const claudeAgents = claudeSessions
+      .filter(s => !allPiNames.has(s.name.toLowerCase()))
+      .filter(s => !brokerAgents.some(ba => ba.pid === s.pid))  // Not already in broker (by PID)
+      .map(s => ({
+        name: s.name,
+        status: s.status === "idle" ? "online" as const : "busy" as const,
+        rawStatus: s.status,
+        runtime: "claude" as const,
+        model: s.model,
+        pid: s.pid as number | undefined,
+        cwd: s.cwd || "",
+        heartbeatAt: Date.now(),
+        startedAt: s.startedAt,
+      }));
+
+    // ── Merge by name (dedup) ──
+    agents = [...brokerAgents, ...orphanAgents, ...claudeAgents];
 
     const ctx = getLiveContext();
     if (ctx) {
@@ -416,110 +408,6 @@ function refreshAgentsFromBroker() {
       if (showPeersInFooter) ctx.ui.setStatus("bridge", `\ud83c\udf10 ${onlineCount}/${agents.length} peers online`);
     }
   }).catch(() => { debugLog("refreshAgentsFromBroker failed, keeping current agents"); });
-
-  // ─── Discover remote peers SEPARATELY (non-blocking) ───
-  refreshRemotePeers();
-}
-
-/** Ping remote peers from config and merge ALL their sessions into agents. Runs independently. */
-function refreshRemotePeers() {
-  const configPeers = (config as any)?.peers;
-  if (!configPeers || typeof configPeers !== "object") return;
-  const peerNames = Object.keys(configPeers);
-  if (peerNames.length === 0) return;
-
-  Promise.all(peerNames.map(async (peerName: string) => {
-    const peerCfg = configPeers[peerName];
-    if (!peerCfg?.host) return { machine: peerName, sessions: [], online: false };
-    const port = peerCfg.bridgePort || config.bridgePort;
-    const baseUrl = `http://${peerCfg.host}:${port}`;
-    try {
-      const res = await fetch(`${baseUrl}/status`, { signal: AbortSignal.timeout(3000) });
-      const data = await res.json();
-      return {
-        machine: peerName,
-        online: data.online,
-        sessionName: data.sessionName || data.name,
-        model: data.model,
-        host: peerCfg.host,
-        bridgePort: port,
-        sessions: (data.sessions || []).map((s: any) => ({
-          name: s.name || s.sessionName || peerName,
-          status: s.status === "online" || s.status === "idle" || s.rawStatus?.includes("idle") ? "online" : s.status === "busy" ? "busy" : "online",
-          rawStatus: s.rawStatus || s.status,
-          runtime: s.runtime || "pi",
-          model: s.model,
-          pid: s.pid,
-          cwd: s.cwd || "",
-        })),
-      };
-    } catch {
-      return { machine: peerName, sessions: [], online: false };
-    }
-  })).then((results) => {
-    for (const result of results) {
-      if (!result) continue;
-      const { machine, sessions, online, host, bridgePort } = result;
-
-      if (!online || sessions.length === 0) {
-        // Machine offline or no sessions — show as single offline peer
-        const existingIdx = agents.findIndex(a => (a as any).remote && ((a as any).configName || "").toLowerCase() === machine.toLowerCase());
-        if (existingIdx >= 0) {
-          Object.assign(agents[existingIdx], { status: "offline", rawStatus: "offline" });
-        }
-        continue;
-      }
-
-      // Add ALL sessions from the remote machine
-      for (const rs of sessions) {
-        const matchKey = `${machine}:${rs.name}`.toLowerCase();
-        const existingIdx = agents.findIndex(a =>
-          (a as any).remote
-          && ((a as any).matchKey === matchKey
-            || ((a as any).configName || "").toLowerCase() === machine.toLowerCase() && a.name.toLowerCase() === rs.name.toLowerCase())
-        );
-        const agent = {
-          name: rs.name,
-          status: rs.status,
-          rawStatus: rs.rawStatus,
-          role: "worker" as const,
-          runtime: rs.runtime,
-          capabilities: [] as string[],
-          specialties: [] as string[],
-          sessionName: rs.name,
-          model: rs.model,
-          cwd: rs.cwd,
-          heartbeatAt: Date.now(),
-          staleCount: 0,
-          remote: true,
-          configName: machine,
-          matchKey,
-          host: host,
-          bridgePort: bridgePort,
-        };
-        if (existingIdx >= 0) {
-          Object.assign(agents[existingIdx], agent);
-        } else if (!agents.some(a => a.name.toLowerCase() === rs.name.toLowerCase())) {
-          agents.push(agent as any);
-        }
-      }
-
-      // Remove stale remote agents from this machine (sessions that no longer exist)
-      const currentNames = new Set(sessions.map(s => s.name.toLowerCase()));
-      for (let i = agents.length - 1; i >= 0; i--) {
-        const a = agents[i] as any;
-        if (a.remote && (a.configName || "").toLowerCase() === machine.toLowerCase() && !currentNames.has(a.name.toLowerCase())) {
-          agents.splice(i, 1);
-        }
-      }
-    }
-    // Update footer count
-    const ctx = getLiveContext();
-    if (ctx) {
-      const onlineCount = agents.filter((a: any) => a.status !== "offline").length;
-      if (showPeersInFooter) ctx.ui.setStatus("bridge", `\ud83c\udf10 ${onlineCount}/${agents.length} peers online`);
-    }
-  }).catch(() => {});
 }
 
 function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: BrokerClient | null): boolean {
@@ -528,7 +416,7 @@ function currentSessionTargetMatches(to: string, resolvedTo?: string | null, act
   add(currentSessionId);
   add(activeClient?.sessionId);
   add(config.localName);
-  add(pi.getSessionName?.());  // Match real session name too
+  add(pi.getSessionName?.());
   return Boolean(resolvedTo && activeClient?.sessionId && resolvedTo === activeClient.sessionId) || targets.has(to.trim().toLowerCase());
 }
 
@@ -569,7 +457,7 @@ function startLocalBridge(port: number) {
         }
         raw += chunk;
       }
-      try { body = JSON.parse(raw); } catch {}
+      try { body = JSON.parse(raw); } catch(_e) {}
     }
 
     if (req.method === "GET" && url.pathname === "/ping") {
@@ -581,11 +469,10 @@ function startLocalBridge(port: number) {
       // Pull the freshest context usage from the local registry entry
       // (heartbeat writes it every 30s).
       const localEntry = readRegistryEntry(config.localName);
-      // Include ALL local broker sessions so remote peers can discover them
-      const allSessions = agents
-        .filter(a => !(a as any).remote && a.status !== "offline")
+      // Include ALL local sessions from agents array
+      let allSessions = agents
         .map(a => ({
-          name: a.sessionName || a.name,
+          name: a.name,
           status: a.status,
           rawStatus: a.rawStatus,
           runtime: a.runtime || "pi",
@@ -593,6 +480,22 @@ function startLocalBridge(port: number) {
           pid: a.pid,
           cwd: a.cwd || "",
         }));
+      // Also add active Pi sessions from JSONL not yet in agents
+      const knownNames = new Set(allSessions.map(s => s.name.toLowerCase()));
+      const activePi = discoverActivePiSessions();
+      for (const s of activePi) {
+        if (!knownNames.has(s.name.toLowerCase())) {
+          allSessions.push({ name: s.name, status: "online", rawStatus: "orphan", runtime: "pi", model: undefined, pid: undefined, cwd: s.cwd });
+        }
+      }
+      // Also add Claude sessions not already in the list
+      const knownPids = new Set(allSessions.filter(s => s.pid).map(s => s.pid!));
+      const claudeSessions = discoverClaudeSessions();
+      for (const cs of claudeSessions) {
+        if (!knownPids.has(cs.pid)) {
+          allSessions.push({ name: cs.name, status: cs.status === "idle" ? "online" : "busy", rawStatus: cs.status, runtime: "claude", model: cs.model, pid: cs.pid, cwd: cs.cwd });
+        }
+      }
       res.end(JSON.stringify({
         name: config.localName,
         sessionName: pi.getSessionName?.() || "unknown",
@@ -740,9 +643,9 @@ function startHeartbeat() {
       }
       // Refresh agents from broker (debounced)
       debouncedRefresh();
-    } catch {}
+    } catch(_e) {}
   }, 30_000);
-  try { (heartbeatTimer as any).unref?.(); } catch {}
+  try { (heartbeatTimer as any).unref?.(); } catch(_e) {}
 }
 
 function startPruneLoop() {
@@ -756,7 +659,7 @@ function startPruneLoop() {
       }
     }
   }, 60_000);
-  try { (pruneTimer as any).unref?.(); } catch {}
+  try { (pruneTimer as any).unref?.(); } catch(_e) {}
 }
 
 function startPendingTasksCleanup() {
@@ -766,15 +669,14 @@ function startPendingTasksCleanup() {
     for (const [taskId, pending] of pendingTasks) {
       if (now - pending.createdAt > PENDING_TASK_TTL_MS) {
         if (pending.timer) clearTimeout(pending.timer);
-        // Signal the awaiter (if any) that we gave up before silently dropping
         if (pending.resolve && !pending.result) {
-          try { pending.resolve({ taskId, rootTaskId: taskId, from: "(expired)", fromSession: "", deliverTo: "", deliverToSession: "", result: "(pending entry expired)", files: [], chain: [], originInstructor: "", originSession: "", needsConsolidation: false, isConsolidated: false, partialResults: [], status: "failed" } as TaskResult); } catch {}
+          try { pending.resolve({ taskId, rootTaskId: taskId, from: "(expired)", fromSession: "", deliverTo: "", deliverToSession: "", result: "(pending entry expired)", files: [], chain: [], originInstructor: "", originSession: "", needsConsolidation: false, isConsolidated: false, partialResults: [], status: "failed" } as TaskResult); } catch(_e) {}
         }
         pendingTasks.delete(taskId);
       }
     }
   }, 5 * 60_000);
-  try { (pendingTasksTimer as any).unref?.(); } catch {}
+  try { (pendingTasksTimer as any).unref?.(); } catch(_e) {}
 }
 
 // ─── Task Injection ───
@@ -867,7 +769,7 @@ export default function extension(api: ExtensionAPI) {
       if (ctx.flags?.project) flagOverrides.project = ctx.flags.project;
       if (ctx.flags?.color) flagOverrides.color = ctx.flags.color;
       if (ctx.flags?.explicit) flagOverrides.explicit = ctx.flags.explicit;
-    } catch {}
+    } catch(_e) {}
 
     try {
       config = { ...loadConfig(), ...flagOverrides };
@@ -888,28 +790,6 @@ export default function extension(api: ExtensionAPI) {
         damageControlRules.readOnlyPaths.length +
         damageControlRules.noDeletePaths.length;
       ctx.ui.notify(`🛡️ Damage Control: ${ruleCount} rules loaded`, "info");
-      // damage-control status intentionally not shown in footer
-    }
-
-    // Load persona files and apply matching one to local config
-    const personas = loadPersonaFiles(ctx.cwd);
-    if (personas.length > 0) {
-      ctx.ui.notify(`👥 Loaded ${personas.length} persona(s) from .pi/agents/`, "info");
-      // If a persona matches this agent's localName, apply its fields to config
-      const myPersona = personas.find((p: PersonaDef) => p.name === config.localName);
-      if (myPersona) {
-        if (myPersona.color && !config.color) config.color = myPersona.color;
-        if (myPersona.purpose && !config.purpose) config.purpose = myPersona.purpose;
-        if (myPersona.role && config.role === "worker") config.role = myPersona.role;
-        if (myPersona.capabilities?.length && config.capabilities.length === 0) {
-          config.capabilities = myPersona.capabilities;
-        }
-        if (myPersona.specialties?.length && config.specialties.length === 0) {
-          config.specialties = myPersona.specialties;
-        }
-        if (myPersona.explicit && !config.explicit) config.explicit = true;
-        ctx.ui.notify(`👤 Applied persona "${myPersona.name}" from ${myPersona.file}`, "info");
-      }
     }
 
     ctx.ui.notify(
@@ -1093,7 +973,7 @@ export default function extension(api: ExtensionAPI) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (pruneTimer) clearInterval(pruneTimer);
     if (pendingTasksTimer) clearInterval(pendingTasksTimer);
-    try { removeRegistryEntry(config.localName); } catch {}
+    try { removeRegistryEntry(config.localName); } catch(_e) {}
     runtimeContext = null;
     currentSessionId = null;
     sessionStartedAt = null;
@@ -1127,7 +1007,7 @@ export default function extension(api: ExtensionAPI) {
             return { block: true, reason: "User denied the action." };
           }
           appendAudit({ event: "confirmed", reason: result.reason });
-        } catch {
+        } catch(_e) {
           appendAudit({ event: "blocked", reason: result.reason });
           return { block: true, reason: "Confirmation timed out." };
         }
@@ -1169,7 +1049,7 @@ export default function extension(api: ExtensionAPI) {
             }
             acquireLock({ filePath: absolutePath, startLine, endLine, agent: config.localName, session: pi.getSessionName?.() || "", taskId: "local-edit", rootTaskId: "local", since: Date.now() }, config);
           }
-        } catch {}
+        } catch(_e) {}
       }
     }
   });
@@ -1197,7 +1077,7 @@ export default function extension(api: ExtensionAPI) {
               }
             }
           }
-        } catch {
+        } catch(_e) {
           // Not JSON — that's fine, return as-is
         }
       }
@@ -1225,7 +1105,7 @@ export default function extension(api: ExtensionAPI) {
           if (committed) {
             appendAudit({ event: "git_commit", taskId: envelope.taskId, sender: config.localName, reason: gitSync.getCurrentBranch() || "unknown" });
           }
-        } catch {}
+        } catch(_e) {}
       }
 
       await transport.sendResult(envelope.deliverTo, resultPayload).catch(() => {
@@ -1314,7 +1194,7 @@ export default function extension(api: ExtensionAPI) {
         }
         return;
       }
-    } catch { /* not JSON, regular message */ }
+    } catch(_e) { /* not JSON, regular message */ }
 
     const turnCtx = replyTracker.recordIncomingMessage(from, message);
     replyTracker.queueTurnContext(turnCtx);
@@ -1325,7 +1205,7 @@ export default function extension(api: ExtensionAPI) {
       if (!activeCtx) return;
 
       let isIdle: boolean;
-      try { isIdle = (activeCtx as any).isIdle?.() ?? true; } catch { return; }
+      try { isIdle = (activeCtx as any).isIdle?.() ?? true; } catch(_e) { return; }
 
       if (!isIdle) {
         // Auto-reply to sender if non-interactive (headless) and this isn't a reply
@@ -1336,7 +1216,7 @@ export default function extension(api: ExtensionAPI) {
               replyTo: message.id,
             });
             if (r.delivered && getLiveContext(ctx, msgGen)) replyTracker.markReplied(message.id);
-          } catch { /* best-effort */ }
+          } catch(_e) { /* best-effort */ }
           return;
         }
         // Interactive but busy — queue for later
@@ -1405,7 +1285,7 @@ export default function extension(api: ExtensionAPI) {
           if (!confirmed) {
             return { content: [{ type: "text", text: "❌ Task send cancelled." }] };
           }
-        } catch {
+        } catch(_e) {
           return { content: [{ type: "text", text: "❌ Confirmation timed out. Task not sent." }] };
         }
       }
@@ -1569,7 +1449,7 @@ export default function extension(api: ExtensionAPI) {
           if (!confirmed) {
             return { content: [{ type: "text", text: "❌ Task send cancelled." }] };
           }
-        } catch {
+        } catch(_e) {
           return { content: [{ type: "text", text: "❌ Confirmation timed out. Task not sent." }] };
         }
       }
@@ -1739,7 +1619,7 @@ export default function extension(api: ExtensionAPI) {
 
       // Try broker sessions first (shows real session names like pi-intercom)
       let brokerSessions: any[] = [];
-      try { if (brokerClient?.isConnected()) brokerSessions = await brokerClient.listSessions(); } catch {}
+      try { if (brokerClient?.isConnected()) brokerSessions = await brokerClient.listSessions(); } catch(_e) {}
 
       if (brokerSessions.length > 0) {
         const others = brokerSessions.filter(s => s.id !== currentSessionId);
@@ -2114,7 +1994,7 @@ export default function extension(api: ExtensionAPI) {
           const connected = brokerClient?.isConnected() ?? false;
           const pending = replyTracker.listPending();
           let sessions: any[] = [];
-          try { if (connected) sessions = await brokerClient.listSessions(); } catch {}
+          try { if (connected) sessions = await brokerClient.listSessions(); } catch(_e) {}
           const others = sessions.filter(s => s.id !== currentSessionId);
           return {
             content: [{ type: "text", text: 
@@ -2783,7 +2663,7 @@ export default function extension(api: ExtensionAPI) {
       if (subcommand === "status" || !subcommand) {
         // Collect pi sessions from broker
         let piSessions: any[] = [];
-        try { if (brokerClient?.isConnected()) piSessions = await brokerClient.listSessions(); } catch {}
+        try { if (brokerClient?.isConnected()) piSessions = await brokerClient.listSessions(); } catch(_e) {}
         const others = piSessions.filter((s: any) => s.id !== currentSessionId);
         const me = piSessions.find((s: any) => s.id === currentSessionId);
         // Collect Claude sessions from ~/.claude/sessions/
@@ -2895,14 +2775,14 @@ export default function extension(api: ExtensionAPI) {
                   text: JSON.stringify({ type: "network_settings_update", settings: networkSettings }),
                   messageId: `settings-${Date.now()}`,
                 });
-              } catch {}
+              } catch(_e) {}
             }
             const claimList = networkSettings.autoClaimPeers.length > 0
               ? networkSettings.autoClaimPeers.join(", ")
               : "none";
             ctx.ui.notify(`⚙️ Settings saved & synced\nTask Board: ${networkSettings.enableTaskBoard ? "ON" : "OFF"}\nAuto-claim: ${claimList}`, "info");
           }
-        } catch {}
+        } catch(_e) {}
         return;
       }
 
@@ -2972,7 +2852,7 @@ export default function extension(api: ExtensionAPI) {
               ctx.ui.notify(`❌ Failed to send: ${e.message}`, "error");
             }
           }
-        } catch {
+        } catch(_e) {
           // Overlay cancelled or errored
         }
         return;
@@ -3069,7 +2949,7 @@ export default function extension(api: ExtensionAPI) {
             ctx.ui.notify(`❌ Failed: ${e.message}`, "error");
           }
         }
-      } catch {}
+      } catch(_e) {}
     },
   });
 }
