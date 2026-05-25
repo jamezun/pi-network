@@ -27,7 +27,7 @@ import { randomUUID } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
 import { execSync } from "node:child_process";
 
-import { loadConfig, resolveMode, getBridgeDir, getPeerUrl, getTailnetPeers } from "./core/config";
+import { loadConfig, resolveMode, getBridgeDir, getPeerUrl, getTailnetPeers, registerPeerHost } from "./core/config";
 import type { BridgeConfig, NetworkMode, AgentStatus } from "./core/config";
 import { createEnvelope, extractResultFromMessages } from "./core/tasks";
 import type { TaskEnvelope, TaskResult } from "./core/tasks";
@@ -745,7 +745,7 @@ function startHeartbeat() {
       if (brokerClient?.isConnected()) {
         const pUpdate = presenceManager.updateContext(Math.round(contextPct), concurrency.getQueueLength(), concurrency.getRunningCount());
         pUpdate.agent = config.localName;
-        brokerClient.updatePresence({ status: presenceManager.formatState() });
+        brokerClient.updatePresence({ status: presenceManager.formatState(), model: currentModel });
       }
       // Refresh agents from broker (debounced)
       debouncedRefresh();
@@ -867,6 +867,8 @@ export default function extension(api: ExtensionAPI) {
     runtimeContext = ctx;
     currentSessionId = ctx.sessionManager.getSessionId();
     currentModel = ctx.model?.id ?? "unknown";
+    // Push model change to broker immediately
+    if (brokerClient?.isConnected()) brokerClient.updatePresence({ model: currentModel });
     sessionStartedAt = Date.now();
 
     // Apply CLI flag overrides
@@ -1114,7 +1116,7 @@ export default function extension(api: ExtensionAPI) {
   pi.on("before_agent_start", async (event, _ctx) => {
     // Phase 1.8: Mark agent as thinking
     presenceManager.setThinking();
-    if (brokerClient) brokerClient.updatePresence({ status: "thinking" });
+    if (brokerClient) brokerClient.updatePresence({ status: "thinking", model: currentModel });
 
     const tailnet = mode === "tailscale" || mode === "hybrid" ? getTailnetPeers() : null;
     const prompt = buildAgentPrompt(agents, config, mode, concurrency, localStatus, tailnet || undefined);
@@ -1148,7 +1150,7 @@ export default function extension(api: ExtensionAPI) {
 
     // Phase 1.8: Tool-level presence
     presenceManager.setToolExecuting(event.toolName);
-    if (brokerClient) brokerClient.updatePresence({ status: `tool:${event.toolName}` });
+    if (brokerClient) brokerClient.updatePresence({ status: `tool:${event.toolName}`, model: currentModel });
 
     // 2. File lock check for write/edit
     if (!["write", "edit"].includes(event.toolName)) return;
@@ -1253,7 +1255,7 @@ export default function extension(api: ExtensionAPI) {
 
     // Phase 1.2: Idle-aware delivery — flush queued messages when agent is idle
     presenceManager.setIdle();
-    if (brokerClient) brokerClient.updatePresence({ status: "idle" });
+    if (brokerClient) brokerClient.updatePresence({ status: "idle", model: currentModel });
     if (idleQueue.length > 0) {
       idleQueue.sortByPriority();
       const pending = idleQueue.dequeueAll();

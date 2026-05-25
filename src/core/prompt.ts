@@ -4,6 +4,11 @@ import type { AgentEntry } from "./registry";
 import type { BridgeConfig, NetworkMode, AgentStatus } from "./config";
 import type { ConcurrencyManager } from "./concurrency";
 
+/** Safely join an array that might be undefined */
+function safeJoin(arr: string[] | undefined, sep = ", "): string {
+  return Array.isArray(arr) ? arr.filter(Boolean).join(sep) : "";
+}
+
 export function buildAgentPrompt(
   agents: AgentEntry[],
   config: BridgeConfig,
@@ -12,7 +17,7 @@ export function buildAgentPrompt(
   localStatus: AgentStatus,
   tailnetPeers?: Map<string, { online: boolean; ip: string }>
 ): string {
-  if (agents.length === 0 && Object.keys(config.peers).length <= 1) return "";
+  if (agents.length === 0 && Object.keys(config.peers || {}).length <= 1) return "";
 
   const myName = config.localName;
   const otherAgents = agents.filter((a) => a.name !== myName);
@@ -62,7 +67,9 @@ export function buildAgentPrompt(
     prompt += "### 🟢 Online (idle)\n";
     for (const a of online) {
       const icon = a.role === "manager" ? "⭐" : "👤";
-      prompt += `- ${icon} **${a.name}** (${a.role}) — ${a.capabilities.join(", ")} | ${a.specialties.join(", ")}\n`;
+      const caps = safeJoin(a.capabilities);
+      const specs = safeJoin(a.specialties);
+      prompt += `- ${icon} **${a.name}** (${a.role || "worker"})${caps ? ` — ${caps}` : ""}${specs ? ` | ${specs}` : ""}\n`;
     }
     prompt += "\n";
   }
@@ -73,7 +80,8 @@ export function buildAgentPrompt(
       const slots = a.maxConcurrentTasks || 3;
       const active = a.activeTaskCount || 0;
       const queued = a.queueLength || 0;
-      prompt += `- 👤 **${a.name}** (${a.role}) — ${active}/${slots} slots used${queued > 0 ? `, ${queued} queued` : ""} | ${a.capabilities.join(", ")}\n`;
+      const caps = safeJoin(a.capabilities);
+      prompt += `- 👤 **${a.name}** (${a.role || "worker"}) — ${active}/${slots} slots used${queued > 0 ? `, ${queued} queued` : ""}${caps ? ` | ${caps}` : ""}\n`;
     }
     prompt += "\n";
   }
@@ -81,7 +89,8 @@ export function buildAgentPrompt(
   if (unresponsive.length > 0) {
     prompt += "### 🟠 Unresponsive\n";
     for (const a of unresponsive) {
-      prompt += `- ⚠️ **${a.name}** (${a.role}) — no activity | ${a.capabilities.join(", ")}\n`;
+      const caps = safeJoin(a.capabilities);
+      prompt += `- ⚠️ **${a.name}** (${a.role || "worker"}) — no activity${caps ? ` | ${caps}` : ""}\n`;
     }
     prompt += "\n";
   }
@@ -89,7 +98,7 @@ export function buildAgentPrompt(
   if (offline.length > 0) {
     prompt += "### 🔴 Offline (tasks will be queued)\n";
     for (const a of offline) {
-      prompt += `- ~~**${a.name}**~~ (${a.role})\n`;
+      prompt += `- ~~**${a.name}**~~ (${a.role || "worker"})\n`;
     }
     prompt += "\n";
   }

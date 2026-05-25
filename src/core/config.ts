@@ -205,9 +205,24 @@ export function getTailnetPeers(): Map<string, { online: boolean; ip: string; la
   return result;
 }
 
+// Dynamic host map — populated by extension.ts from discovered remote agents
+let dynamicHostMap: Record<string, { host: string; bridgePort?: number }> = {};
+
+export function registerPeerHost(sessionName: string, host: string, bridgePort?: number): void {
+  dynamicHostMap[sessionName.toLowerCase()] = { host, bridgePort };
+}
+
 export function getPeerUrl(peerName: string, config: BridgeConfig): string {
   const peer = config.peers[peerName];
-  if (!peer) throw new Error(`Unknown peer: ${peerName}`);
+  if (!peer) {
+    // Check dynamic host map (remote agents discovered at runtime)
+    const dyn = dynamicHostMap[peerName.toLowerCase()];
+    if (dyn) {
+      const port = dyn.bridgePort || config.bridgePort;
+      return `http://${dyn.host}:${port}`;
+    }
+    throw new Error(`Unknown peer: ${peerName}`);
+  }
   const port = peer.bridgePort || config.bridgePort;
   // Use explicit host if configured, otherwise try Tailscale DNS match, fall back to peerName
   if ((peer as any).host) return `http://${(peer as any).host}:${port}`;
