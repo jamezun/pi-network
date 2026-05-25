@@ -465,11 +465,28 @@ function refreshAgentsFromBroker() {
         startedAt: s.startedAt,
       }));
 
+    // ── Dedup broker agents by name (keep most recently active) ──
+    const brokerDeduped: typeof brokerAgents = [];
+    const byName = new Map<string, typeof brokerAgents[0]>();
+    for (const ba of brokerAgents) {
+      const key = ba.name.toLowerCase();
+      const existing = byName.get(key);
+      if (!existing) {
+        byName.set(key, ba);
+      } else {
+        // Keep the one with more recent activity or higher PID (likely the current one)
+        const existingTime = existing.heartbeatAt || existing.startedAt || 0;
+        const newTime = ba.heartbeatAt || ba.startedAt || 0;
+        if (newTime >= existingTime) byName.set(key, ba);
+      }
+    }
+    for (const ba of byName.values()) brokerDeduped.push(ba);
+
     // ── Merge by name (dedup), preserve remote peers ──
     // Keep existing remote peers + synthetic WhatsApp peer so they don't get wiped
     const existingRemote = agents.filter(a => (a as any).remote);
     const existingSynthetic = agents.filter(a => (a as any).runtime === "whatsapp");
-    agents = [...brokerAgents, ...orphanAgents, ...claudeAgents, ...existingRemote, ...existingSynthetic];
+    agents = [...brokerDeduped, ...orphanAgents, ...claudeAgents, ...existingRemote, ...existingSynthetic];
 
     const ctx = getLiveContext();
     if (ctx) {
