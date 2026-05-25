@@ -922,6 +922,34 @@ function deliverResult(result: TaskResult) {
   // Phase 2.4: Deliver to WhatsApp if needed
   if (whatsappBridge) {
     whatsappBridge.deliverResult(result).catch(() => {});
+    // Forward actual files to WhatsApp (not just the text listing)
+    if (result.files?.length > 0 && result.deliverTo === "whatsapp") {
+      const waNumber = result.originSession || (config as any)?.whatsapp?.allowedNumbers?.length > 1
+        ? (config as any).whatsapp.allowedNumbers[(config as any).whatsapp.allowedNumbers.length - 1]
+        : (config as any)?.whatsapp?.allowedNumbers?.[0];
+      if (waNumber) {
+        for (const file of result.files) {
+          // file.content is base64, file.path is local path
+          let base64Content = file.content;
+          if (!base64Content && file.path) {
+            try {
+              const buf = require("fs").readFileSync(file.path);
+              base64Content = buf.toString("base64");
+            } catch {}
+          }
+          if (base64Content) {
+            const ext = (file.filename || file.path || "").split(".").pop()?.toLowerCase();
+            const mimeMap: Record<string, string> = {
+              pdf: "application/pdf", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+              xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              png: "image/png", jpg: "image/jpeg", txt: "text/plain", md: "text/markdown",
+            };
+            const mimeType = mimeMap[ext || ""] || "application/octet-stream";
+            whatsappBridge.sendFile(waNumber, base64Content, file.filename || "file", mimeType).catch(() => {});
+          }
+        }
+      }
+    }
   }
 }
 

@@ -408,8 +408,9 @@ export class WhatsAppBridge {
    */
   async sendFile(to: string, data: Buffer | string, fileName: string, mimeType: string, caption?: string): Promise<void> {
     const base64 = typeof data === "string" ? data : data.toString("base64");
+    console.log("WhatsAppBridge.sendFile:", fileName, "mimeType:", mimeType, "base64 length:", base64.length);
     try {
-      await fetch(`${this.waConfig.evolutionApiUrl}/message/sendDocument/${this.waConfig.instanceName}`, {
+      const res = await fetch(`${this.waConfig.evolutionApiUrl}/message/sendDocument/${this.waConfig.instanceName}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", apikey: this.waConfig.evolutionApiKey },
         body: JSON.stringify({
@@ -417,8 +418,13 @@ export class WhatsAppBridge {
           document: base64,
           fileName: fileName || "file",
           caption: caption || fileName || "",
+          mimetype: mimeType,
         }),
       });
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => "");
+        console.error("WhatsAppBridge.sendFile FAILED:", res.status, errBody);
+      }
     } catch (e: any) {
       console.error(`WhatsApp sendFile error: ${e.message}`);
     }
