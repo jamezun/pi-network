@@ -85,11 +85,40 @@ export function discoverActivePiSessions(maxAgeMs: number = 4 * 60 * 60 * 1000):
     .filter(r => { if (seen.has(r.name)) return false; seen.add(r.name); return true; });
 }
 
-// ── Claude session discovery (from ~/.claude/sessions/) ─────────────
+// ── Extract last-used model from Claude transcript ─────────────────
+function encodeCwd(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, "-");
+}
 
+function readLastModel(transcriptPath: string): string | null {
+  try {
+    if (!existsSync(transcriptPath)) return null;
+    const stat = statSync(transcriptPath);
+    const start = Math.max(0, stat.size - 50_000);
+    const fd = require("fs").openSync(transcriptPath, "r");
+    const buf = Buffer.alloc(stat.size - start);
+    require("fs").readSync(fd, buf, 0, buf.length, start);
+    require("fs").closeSync(fd);
+    const lines = buf.toString("utf8").split("\n").reverse();
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const obj = JSON.parse(trimmed);
+        if (obj.message?.model && obj.message.model !== "<synthetic>") {
+          return obj.message.model;
+        }
+      } catch(_e) { /* skip */ }
+    }
+  } catch(_e) { /* ignore */ }
+  return null;
+}
+
+// ── Claude session discovery (from ~/.claude/sessions/) ─────────────
 export function discoverClaudeSessions(): DiscoveredSession[] {
   const claudeDir = join(homedir(), ".claude");
   const sessionsDir = join(claudeDir, "sessions");
+  const projectsDir = join(claudeDir, "projects");
   if (!existsSync(sessionsDir)) return [];
 
   let files: string[];
@@ -106,6 +135,11 @@ export function discoverClaudeSessions(): DiscoveredSession[] {
 
       const name = session.name?.trim() || `Claude ${session.sessionId?.slice(0, 8) || "?"}`;
 
+      // Read actual model from Claude transcript
+      const projectDir = join(projectsDir, encodeCwd(session.cwd || ""));
+      const transcriptPath = join(projectDir, `${session.sessionId}.jsonl`);
+      const model = readLastModel(transcriptPath);
+
       results.push({
         name,
         runtime: "claude",
@@ -113,6 +147,7 @@ export function discoverClaudeSessions(): DiscoveredSession[] {
         pid: session.pid,
         cwd: session.cwd || "",
         startedAt: session.startedAt,
+        model: model || undefined,
       });
     } catch(_e) {}
   }

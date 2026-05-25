@@ -412,6 +412,109 @@ function refreshAgentsFromBroker() {
   }).catch(() => { debugLog("refreshAgentsFromBroker failed, keeping current agents"); });
 }
 
+/** Ping remote peers from config and merge ALL their sessions into agents. */
+function refreshRemotePeers() {
+  const configPeers = (config as any)?.peers;
+  if (!configPeers || typeof configPeers !== "object") return;
+  const peerNames = Object.keys(configPeers);
+  if (peerNames.length === 0) return;
+
+  Promise.all(peerNames.map(async (peerName: string) => {
+    const peerCfg = configPeers[peerName];
+    if (!peerCfg?.host) return { machine: peerName, sessions: [], online: false };
+    const port = peerCfg.bridgePort || config.bridgePort;
+    const baseUrl = `http://${peerCfg.host}:${port}`;
+    try {
+      const res = await fetch(`${baseUrl}/status`, { signal: AbortSignal.timeout(3000) });
+      const data = await res.json();
+      return {
+        machine: peerName,
+        online: data.online,
+        sessionName: data.sessionName || data.name,
+        model: data.model,
+        host: peerCfg.host,
+        bridgePort: port,
+        sessions: (data.sessions || []).map((s: any) => ({
+          name: s.name || s.sessionName || peerName,
+          status: s.rawStatus?.includes("idle") || s.rawStatus?.includes("online") || s.status === "online" ? "online" as const : s.status === "busy" ? "busy" as const : "online" as const,
+          rawStatus: s.rawStatus || s.status,
+          runtime: s.runtime || "pi",
+          model: s.model,
+          pid: s.pid,
+          cwd: s.cwd || "",
+        })),
+      };
+    } catch {
+      return { machine: peerName, sessions: [], online: false, host: peerCfg.host, bridgePort: port };
+    }
+  })).then((results) => {
+    for (const result of results) {
+      if (!result) continue;
+      const { machine, sessions, online, host, bridgePort } = result;
+
+      if (!online || sessions.length === 0) {
+        // Machine offline — mark existing remote agents from this machine as offline
+        for (const a of agents) {
+          if ((a as any).remote && ((a as any).configName || "").toLowerCase() === machine.toLowerCase()) {
+            a.status = "offline";
+          }
+        }
+        continue;
+      }
+
+      // Add ALL sessions from the remote machine
+      for (const rs of sessions) {
+        const matchKey = `${machine}:${rs.name}`.toLowerCase();
+        const existingIdx = agents.findIndex(a =>
+          (a as any).remote
+          && ((a as any).matchKey === matchKey
+            || ((a as any).configName || "").toLowerCase() === machine.toLowerCase() && a.name.toLowerCase() === rs.name.toLowerCase())
+        );
+        const agent = {
+          name: rs.name,
+          status: rs.status,
+          rawStatus: rs.rawStatus,
+          role: "worker" as const,
+          runtime: rs.runtime,
+          capabilities: [] as string[],
+          specialties: [] as string[],
+          sessionName: rs.name,
+          model: rs.model,
+          cwd: rs.cwd,
+          heartbeatAt: Date.now(),
+          staleCount: 0,
+          remote: true,
+          configName: machine,
+          matchKey,
+          host: host,
+          bridgePort: bridgePort,
+        } as any;
+        if (existingIdx >= 0) {
+          Object.assign(agents[existingIdx], agent);
+        } else if (!agents.some(a => a.name.toLowerCase() === rs.name.toLowerCase())) {
+          agents.push(agent);
+        }
+      }
+
+      // Remove stale remote agents from this machine
+      const currentNames = new Set(sessions.map(s => s.name.toLowerCase()));
+      for (let i = agents.length - 1; i >= 0; i--) {
+        const a = agents[i] as any;
+        if (a.remote && (a.configName || "").toLowerCase() === machine.toLowerCase() && !currentNames.has(a.name.toLowerCase())) {
+          agents.splice(i, 1);
+        }
+      }
+    }
+    debugLog(`remote peers merged: ${agents.filter(a => (a as any).remote).map(a => a.name).join(", ") || "none"}`);
+    // Update footer
+    const ctx = getLiveContext();
+    if (ctx) {
+      const onlineCount = agents.filter((a: any) => a.status !== "offline").length;
+      if (showPeersInFooter) ctx.ui.setStatus("bridge", `\ud83c\udf10 ${onlineCount}/${agents.length} peers online`);
+    }
+  }).catch(() => {});
+}
+
 function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: BrokerClient | null): boolean {
   const targets = new Set<string>();
   const add = (t: string | null | undefined) => { const v = t?.trim(); if (v) targets.add(v.toLowerCase()); };
@@ -645,6 +748,8 @@ function startHeartbeat() {
       }
       // Refresh agents from broker (debounced)
       debouncedRefresh();
+      // Refresh remote peers from config.peers
+      refreshRemotePeers();
     } catch(_e) {}
   }, 30_000);
   try { (heartbeatTimer as any).unref?.(); } catch(_e) {}
@@ -818,6 +923,8 @@ export default function extension(api: ExtensionAPI) {
     startHeartbeat();
     startPruneLoop();
     startPendingTasksCleanup();
+    // Initial remote peer discovery
+    refreshRemotePeers();
 
     // ─── Phase 1.1: Auto-discovery broker (deferred to next tick) ───
     const startupGen = runtimeGeneration;
