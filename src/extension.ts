@@ -315,8 +315,14 @@ function findJsonlFile(sessionId: string | undefined): string {
   try {
     const subdirs = require("fs").readdirSync(dir);
     for (const sub of subdirs) {
-      const candidate = require("path").join(dir, sub, sessionId + ".jsonl");
-      if (require("fs").existsSync(candidate)) return candidate;
+      const subPath = require("path").join(dir, sub);
+      if (!require("fs").statSync(subPath).isDirectory()) continue;
+      const files = require("fs").readdirSync(subPath);
+      for (const file of files) {
+        if (file.endsWith("_" + sessionId + ".jsonl")) {
+          return require("path").join(subPath, file);
+        }
+      }
     }
   } catch {}
   return "";
