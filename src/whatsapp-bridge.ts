@@ -229,9 +229,13 @@ export class WhatsAppBridge {
     };
 
     // Route: check if peer is local (broker) or remote (HTTP transport)
-        let result: { delivered: boolean; queued?: boolean };
+        console.log(`[WA-bridge] handleTask: peer=${parsed.peer}, brokerConnected=${!!this.brokerClient?.isConnected?.()}`);
+        const liveAgents = this.getLiveAgents?.() || [];
+        const targetAgent = liveAgents.find((a: any) => a.name.toLowerCase() === parsed.peer.toLowerCase());
         const isLocalPeer = this.brokerClient?.isConnected() && 
-          this.getLiveAgents?.()?.some((a: any) => a.name.toLowerCase() === parsed.peer.toLowerCase() && !a.remote);
+          targetAgent && !targetAgent.remote;
+        console.log(`[WA-bridge] targetAgent: ${JSON.stringify({name: targetAgent?.name, remote: targetAgent?.remote, status: targetAgent?.status})}, isLocal=${isLocalPeer}`);
+        let result: { delivered: boolean; queued?: boolean };
         try {
           if (isLocalPeer) {
             // Local session — deliver via broker

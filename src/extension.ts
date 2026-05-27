@@ -713,6 +713,7 @@ function startLocalBridge(port: number) {
     }
 
     if (req.method === "POST" && url.pathname === "/task") {
+      debugLog(`/task received: targetPeer=${req.headers["x-target-peer"]}, local=${pi.getSessionName?.() || config.localName}`);
       const envelope: TaskEnvelope = body;
       const targetPeer = req.headers["x-target-peer"] as string | undefined;
 
