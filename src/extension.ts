@@ -713,34 +713,11 @@ function startLocalBridge(port: number) {
     }
 
     if (req.method === "POST" && url.pathname === "/task") {
-      debugLog(`/task received: targetPeer=${req.headers["x-target-peer"]}, local=${pi.getSessionName?.() || config.localName}`);
       const envelope: TaskEnvelope = body;
-      const targetPeer = req.headers["x-target-peer"] as string | undefined;
-
-      // If this task is for a different local session, forward via broker
-      const localSessionName = pi.getSessionName?.() || config.localName;
-      if (targetPeer && targetPeer.toLowerCase() !== localSessionName.toLowerCase()) {
-        debugLog(`/task forwarding to local session: ${targetPeer} (I am ${localSessionName})`);
-        try {
-          if (brokerClient && brokerClient.isConnected()) {
-            await brokerClient.send(targetPeer, {
-              text: envelope.task,
-              expectsReply: envelope.deliverTo === "whatsapp" || !!envelope.deliverTo,
-              taskId: envelope.taskId,
-            });
-            res.end(JSON.stringify({ accepted: true, status: "forwarded", target: targetPeer }));
-          } else {
-            debugLog(`/task: broker not connected, accepting locally`);
-            res.end(JSON.stringify({ accepted: true, status: "accepted-local" }));
-            injectTask(envelope);
-          }
-        } catch (e: any) {
-          debugLog(`/task forward failed: ${e.message}, accepting locally`);
-          res.end(JSON.stringify({ accepted: true, status: "accepted-local" }));
-          injectTask(envelope);
-        }
-        return;
-      }
+      // Just inject locally — the HTTP bridge owner handles all incoming tasks
+      res.end(JSON.stringify({ accepted: true, status: "running" }));
+      injectTask(envelope);
+      return;
 
       // Defensive: legacy senders may omit hops field — treat as 0.
       const inboundHops = typeof envelope.hops === "number" ? envelope.hops : 0;
