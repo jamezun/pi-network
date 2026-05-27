@@ -227,7 +227,7 @@ async function ensureBrokerConnected(reason: "startup" | "background" | "tool" |
     try {
       await spawnBrokerIfNeeded();
       await nextClient.connect({
-        name: pi.getSessionName?.() || `${config.localName}:${process.pid}`, // Real session name for discovery
+        name: process.env.PI_NETWORK_NAME || pi.getSessionName?.() || `${config.localName}:${process.pid}`, // Env var > session name > fallback
         localName: config.localName,                     // Machine identity for routing
         cwd: ctx.cwd, model: normalizeModel(currentModel), pid: process.pid,
         startedAt: sessionStartedAt!, lastActivity: Date.now(),
