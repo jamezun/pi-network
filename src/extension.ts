@@ -907,6 +907,30 @@ function injectTask(envelope: TaskEnvelope) {
 }
 
 function deliverResult(result: TaskResult) {
+  // If deliverTo is whatsapp and we have a local WA bridge, deliver directly
+  if (result.deliverTo === "whatsapp" && whatsappBridge) {
+    whatsappBridge.deliverResult(result).catch(() => {});
+    return;
+  }
+  // If deliverTo is whatsapp but we DON'T have WA bridge, forward to all known peers
+  // (one of them has the WA bridge)
+  if (result.deliverTo === "whatsapp") {
+    for (const [name, cfg] of Object.entries(config.peers || {})) {
+      const host = (cfg as any)?.host;
+      const port = (cfg as any)?.bridgePort || config.bridgePort;
+      if (host) {
+        fetch(`http://${host}:${port}/result`, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(result), signal: AbortSignal.timeout(5000) }).catch(() => {});
+      }
+    }
+    return;
+  }
+  // Forward results to origin machine if not local
+  if (result.deliverTo && result.deliverTo !== config.localName) {
+    const peerUrl = getPeerUrl(result.deliverTo, config);
+    if (peerUrl) {
+      fetch(`${peerUrl}/result`, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(result), signal: AbortSignal.timeout(5000) }).catch(() => {});
+    }
+  }
   if (result.deliverTo !== config.localName) return;
 
   let message = `📬 Result from ${result.from}/${result.fromSession || "unknown"}:\n\n`;
