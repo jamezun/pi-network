@@ -668,8 +668,9 @@ function startLocalBridge(port: number) {
       // Pull the freshest context usage from the local registry entry
       // (heartbeat writes it every 30s).
       const localEntry = readRegistryEntry(config.localName);
-      // Include ALL local sessions from agents array
+      // Include only LOCAL sessions from agents (not remote peers from other machines)
       let allSessions = agents
+        .filter(a => !(a as any).remote)
         .map(a => ({
           name: a.name,
           status: a.status,
