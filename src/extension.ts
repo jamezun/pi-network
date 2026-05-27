@@ -309,6 +309,18 @@ const taskResults: Map<string, string> = new Map();
 
 let lastInjectSize = 0;
 let injectTimestamp = 0;
+function findJsonlFile(sessionId: string | undefined): string {
+  if (!sessionId) return "";
+  const dir = require("path").join(require("os").homedir(), ".pi/agent/sessions");
+  try {
+    const subdirs = require("fs").readdirSync(dir);
+    for (const sub of subdirs) {
+      const candidate = require("path").join(dir, sub, sessionId + ".jsonl");
+      if (require("fs").existsSync(candidate)) return candidate;
+    }
+  } catch {}
+  return "";
+}
 function deliverRemoteResult(taskId: string, result: string, deliverTo: string, callbackUrl?: string) {
   taskResults.set(taskId, result);
   if (callbackUrl) {
@@ -969,7 +981,7 @@ function injectTask(envelope: TaskEnvelope) {
       }
       // Fallback: scan latest JSONL for assistant response containing taskId
       try {
-        const sessionFile = require("path").join(jsonlDir, currentSessionId + ".jsonl");
+        const sessionFile = findJsonlFile(currentSessionId);
         if (!require("fs").existsSync(sessionFile)) return;
         const stat = require("fs").statSync(sessionFile);
         if (stat.size < lastInjectSize) return;
@@ -979,8 +991,8 @@ function injectTask(envelope: TaskEnvelope) {
         for (let i = lines.length - 1; i >= 0; i--) {
           try {
             const entry = JSON.parse(lines[i]);
-            if (entry.type === "assistant" && entry.timestamp > injectTimestamp) {
-              const text = entry.message?.content?.map((c: any) => c.text || "").join("") || "";
+            if (entry.type === "message" && entry.message?.role === "assistant" && new Date(entry.timestamp).getTime() > injectTimestamp) {
+              const text = entry.message?.content?.filter((c: any) => c.type === "text").map((c: any) => c.text || "").join("") || "";
               if (text.length > 0) {
                 clearInterval(pollInterval);
                 deliverRemoteResult(taskId, text.slice(0, 2000), deliverTo, callbackUrl);
