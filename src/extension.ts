@@ -970,7 +970,7 @@ function injectTask(envelope: TaskEnvelope) {
     let pollCount = 0;
     const pollInterval = setInterval(() => {
       pollCount++;
-      if (pollCount > 90) { clearInterval(pollInterval); return; } // 3min timeout
+      if (pollCount > 90) { clearInterval(pollInterval); debugLog("response poll timeout for " + taskId); return; } // 3min timeout
       // Check taskResults first (set by result capture hook)
       const captured = taskResults.get(taskId);
       if (captured) {
@@ -982,6 +982,7 @@ function injectTask(envelope: TaskEnvelope) {
       // Fallback: scan latest JSONL for assistant response containing taskId
       try {
         const sessionFile = findJsonlFile(currentSessionId);
+        if (pollCount <= 3) debugLog("poll " + taskId + ": file=" + sessionFile + " sessionId=" + currentSessionId + " ts=" + injectTimestamp);
         if (!require("fs").existsSync(sessionFile)) return;
         const stat = require("fs").statSync(sessionFile);
         if (stat.size < lastInjectSize) return;
@@ -991,7 +992,10 @@ function injectTask(envelope: TaskEnvelope) {
         for (let i = lines.length - 1; i >= 0; i--) {
           try {
             const entry = JSON.parse(lines[i]);
-            if (entry.type === "message" && entry.message?.role === "assistant" && new Date(entry.timestamp).getTime() > injectTimestamp) {
+            if (entry.type === "message" && entry.message?.role === "assistant") {
+            const entryTs = new Date(entry.timestamp).getTime();
+            if (pollCount <= 3) debugLog("poll found assistant msg: ts=" + entryTs + " injectTs=" + injectTimestamp + " match=" + (entryTs > injectTimestamp));
+            if (entryTs <= injectTimestamp) continue;
               const text = entry.message?.content?.filter((c: any) => c.type === "text").map((c: any) => c.text || "").join("") || "";
               if (text.length > 0) {
                 clearInterval(pollInterval);
