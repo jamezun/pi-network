@@ -482,11 +482,18 @@ function refreshAgentsFromBroker() {
     }
     for (const ba of byName.values()) brokerDeduped.push(ba);
 
-    // ── Merge by name (dedup), preserve remote peers ──
-    // Keep existing remote peers + synthetic WhatsApp peer so they don't get wiped
-    const existingRemote = agents.filter(a => (a as any).remote);
+    // ── Merge: dedup all by name, preserve remote + WhatsApp ──
+    const existingRemote = agents.filter(a => (a as any).remote && (a as any).runtime !== "whatsapp");
     const existingSynthetic = agents.filter(a => (a as any).runtime === "whatsapp");
-    agents = [...brokerDeduped, ...orphanAgents, ...claudeAgents, ...existingRemote, ...existingSynthetic];
+    const merged = [...brokerDeduped, ...orphanAgents, ...claudeAgents, ...existingRemote, ...existingSynthetic];
+    // Final dedup by name (keep first occurrence = highest priority source)
+    const seen = new Set<string>();
+    agents = merged.filter(a => {
+      const key = a.name.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 
     const ctx = getLiveContext();
     if (ctx) {
@@ -546,8 +553,9 @@ function refreshRemotePeers() {
         continue;
       }
 
-      // Add ALL sessions from the remote machine
-      for (const rs of sessions) {
+      // Add ALL sessions from the remote machine (skip WhatsApp synthetics)
+      const remoteSessions = sessions.filter((s: any) => s.runtime !== "whatsapp");
+      for (const rs of remoteSessions) {
         const matchKey = `${machine}:${rs.name}`.toLowerCase();
         const existingIdx = agents.findIndex(a =>
           (a as any).remote
@@ -1135,6 +1143,7 @@ export default function extension(api: ExtensionAPI) {
         render(width: number) {
           if (!showPeersInFooter) return [""];
           if (agents.length === 0) return [theme.fg("dim", "  🌐 Discovering peers...")];
+          const displayAgents = agents.slice(0, 20);  // Cap to prevent OOM
 
           if (peerLayout === "vertical") {
             const lines: string[] = [theme.fg("dim", "  🌐 Pi Network")];
@@ -1150,7 +1159,7 @@ export default function extension(api: ExtensionAPI) {
 
           // Horizontal: peers inline, wrap at terminal width
           const tokens: string[] = [];
-          for (const agent of agents) {
+          for (const agent of displayAgents) {
             const dot = agent.status === "online" ? "\ud83d\udfe2" : agent.status === "busy" ? "\ud83d\udfe1" : "\ud83d\udd34";
             const name = agent.color ? hexFg(agent.color, agent.name) : theme.fg("accent", agent.name);
             const rt = (agent as any).runtime === "claude" ? theme.fg("dim", " [claude]") : (agent as any).runtime === "pi" ? theme.fg("dim", " [pi]") : (agent as any).runtime === "whatsapp" ? theme.fg("dim", " [whatsapp]") : "";
