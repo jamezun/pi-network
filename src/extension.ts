@@ -679,17 +679,16 @@ function startLocalBridge(port: number) {
           pid: a.pid,
           cwd: a.cwd || "",
         }));
-      // Also add active Pi sessions from JSONL not yet in agents
+      // Only add discovered sessions if their process is still running
       const knownNames = new Set(allSessions.map(s => s.name.toLowerCase()));
-      const activePi = discoverActivePiSessions();
+      const activePi = discoverActivePiSessions().filter(s => s.pid && require("fs").existsSync("/proc/" + s.pid));
       for (const s of activePi) {
         if (!knownNames.has(s.name.toLowerCase())) {
-          allSessions.push({ name: s.name, status: "online", rawStatus: "orphan", runtime: "pi", model: undefined, pid: undefined, cwd: s.cwd });
+          allSessions.push({ name: s.name, status: "online", rawStatus: "orphan", runtime: "pi", model: undefined, pid: s.pid, cwd: s.cwd });
         }
       }
-      // Also add Claude sessions not already in the list
       const knownPids = new Set(allSessions.filter(s => s.pid).map(s => s.pid!));
-      const claudeSessions = discoverClaudeSessions();
+      const claudeSessions = discoverClaudeSessions().filter(cs => require("fs").existsSync("/proc/" + cs.pid));
       for (const cs of claudeSessions) {
         if (!knownPids.has(cs.pid)) {
           allSessions.push({ name: cs.name, status: cs.status === "idle" ? "online" : "busy", rawStatus: cs.status, runtime: "claude", model: cs.model, pid: cs.pid, cwd: cs.cwd });
