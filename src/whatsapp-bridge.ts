@@ -228,20 +228,29 @@ export class WhatsAppBridge {
       userId: from,
     };
 
-    // Try broker delivery first (local sessions), then HTTP transport (remote)
+    // Route: check if peer is local (broker) or remote (HTTP transport)
         let result: { delivered: boolean; queued?: boolean };
+        const isLocalPeer = this.brokerClient?.isConnected() && 
+          this.getLiveAgents?.()?.some((a: any) => a.name.toLowerCase() === parsed.peer.toLowerCase() && !a.remote);
         try {
-          if (this.brokerClient && this.brokerClient.isConnected()) {
+          if (isLocalPeer) {
+            // Local session — deliver via broker
             const brokerResult = await this.brokerClient.send(parsed.peer, { text: parsed.task, expectsReply: true, taskId: envelope.taskId });
-            result = { delivered: brokerResult?.delivered ?? true, queued: false };
+            result = { delivered: brokerResult?.delivered ?? false, queued: false };
           } else {
+            // Remote peer — deliver via HTTP transport (TailscaleTransport with X-Target-Peer)
             result = await this.meshTransport.send(parsed.peer, envelope);
           }
-        } catch {
+        } catch (e: any) {
+          // First path failed, try the other
           try {
-            result = await this.meshTransport.send(parsed.peer, envelope);
-          } catch (e: any) {
-            await this.sendReply(from, formatError("Failed to deliver: " + e.message));
+            if (isLocalPeer) {
+              result = await this.meshTransport.send(parsed.peer, envelope);
+            } else {
+              result = await this.meshTransport.send(parsed.peer, envelope);
+            }
+          } catch (e2: any) {
+            await this.sendReply(from, formatError("Failed to deliver: " + e2.message));
             return;
           }
         }

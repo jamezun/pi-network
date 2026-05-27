@@ -21,7 +21,7 @@ export class TailscaleTransport implements Transport {
     try {
       const res = await fetch(`${url}/task`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-Target-Peer": peer },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(5000),
       });
