@@ -976,7 +976,7 @@ function injectTask(envelope: TaskEnvelope) {
     let pollCount = 0;
     const pollInterval = setInterval(() => {
       pollCount++;
-      if (pollCount > 90) { clearInterval(pollInterval); debugLog("response poll timeout for " + taskId); return; } // 3min timeout
+      if (pollCount > 90) { clearInterval(pollInterval);  return; } // 3min timeout
       // Check taskResults first (set by result capture hook)
       const captured = taskResults.get(taskId);
       if (captured) {
