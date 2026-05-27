@@ -21,7 +21,7 @@ export class TailscaleTransport implements Transport {
     try {
       const res = await fetch(`${url}/task`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Target-Peer": peer },
+        headers: { "Content-Type": "application/json", "X-Target-Peer": peer, "X-Sender-Host": this.config.localHost || "127.0.0.1", "X-Sender-Port": String(this.config.bridgePort), "X-Wait-For-Response": "true" },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(5000),
       });

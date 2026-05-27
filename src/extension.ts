@@ -305,6 +305,28 @@ const DEBUG_LOG = require("os").homedir() + "/.pi/agent/intercom/pi-network-debu
 function debugLog(msg: string) {
   try { require("fs").appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch(_e) {}
 }
+const taskResults: Map<string, string> = new Map();
+
+let lastInjectSize = 0;
+let injectTimestamp = 0;
+function deliverRemoteResult(taskId: string, result: string, deliverTo: string, callbackUrl?: string) {
+  taskResults.set(taskId, result);
+  if (callbackUrl) {
+    fetch(callbackUrl, { method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ taskId, result, from: config.localName, deliverTo }),
+      signal: AbortSignal.timeout(5000) }).catch(() => {});
+  }
+  // Also forward to config peers as fallback
+  for (const [name, cfg] of Object.entries(config.peers || {})) {
+    const host = (cfg as any)?.host;
+    const port = (cfg as any)?.bridgePort || config.bridgePort;
+    if (host) {
+      fetch("http://" + host + ":" + port + "/result", { method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ taskId, result, from: config.localName, deliverTo }),
+        signal: AbortSignal.timeout(5000) }).catch(() => {});
+    }
+  }
+}
 let showPeersInFooter = true;  // toggle with /network peers
 let peerLayout: "horizontal" | "vertical" = "horizontal";
 let networkSettings: NetworkSettings = loadNetworkSettings();
@@ -714,10 +736,46 @@ function startLocalBridge(port: number) {
 
     if (req.method === "POST" && url.pathname === "/task") {
       const envelope: TaskEnvelope = body;
-      // Just inject locally — the HTTP bridge owner handles all incoming tasks
+      // For remote tasks with deliverTo: wait for agent response and return it
+      if (envelope.deliverTo && envelope.deliverTo !== config.localName && req.headers["x-wait-for-response"]) {
+        // Synchronous mode: inject task, wait up to 60s for response
+        injectTask(envelope);
+        const responsePromise = new Promise<string>((resolve) => {
+          const timer = setTimeout(() => resolve("(timeout)"), 60000);
+          const checkInterval = setInterval(() => {
+            const result = taskResults.get(envelope.taskId);
+            if (result) {
+              clearTimeout(timer);
+              clearInterval(checkInterval);
+              taskResults.delete(envelope.taskId);
+              resolve(result);
+            }
+          }, 500);
+        });
+        const response = await responsePromise;
+        res.end(JSON.stringify({ accepted: true, status: "completed", result: response }));
+        // Also forward result to callback URL if provided
+        const senderHost = req.headers["x-sender-host"] as string | undefined;
+        if (senderHost) {
+          const senderPort = (req.headers["x-sender-port"] as string | undefined) || config.bridgePort;
+          const callbackUrl = "http://" + senderHost + ":" + senderPort + "/result";
+          fetch(callbackUrl, { method: "POST", headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({ taskId: envelope.taskId, result: response, from: config.localName, deliverTo: envelope.deliverTo }),
+            signal: AbortSignal.timeout(5000) }).catch(() => {});
+        }
+        return;
+      }
       res.end(JSON.stringify({ accepted: true, status: "running" }));
       injectTask(envelope);
       return;
+
+      // Get task result
+    const getMatch = url.pathname.match(/^\/task\/([\w-]+)$/);
+    if (req.method === "GET" && getMatch) {
+      const result = taskResults.get(getMatch[1]);
+      res.end(JSON.stringify({ taskId: getMatch[1], completed: !!result, result: result || null }));
+      return;
+    }
 
       // Defensive: legacy senders may omit hops field — treat as 0.
       const inboundHops = typeof envelope.hops === "number" ? envelope.hops : 0;
@@ -888,6 +946,52 @@ function startPendingTasksCleanup() {
 
 function injectTask(envelope: TaskEnvelope) {
   activeEnvelopes.set(envelope.taskId, envelope);
+  if (envelope.deliverTo && envelope.deliverTo !== config.localName) {
+    (envelope as any)._remoteResult = true;
+  }
+  // Capture agent response for remote tasks by watching JSONL
+  const callbackUrl = (envelope as any)._callbackUrl;
+  if ((callbackUrl || (envelope as any)._remoteResult) && envelope.deliverTo) {
+    const taskId = envelope.taskId;
+    const deliverTo = envelope.deliverTo;
+    const jsonlDir = require("path").join(require("os").homedir(), ".pi/agent/sessions");
+    let pollCount = 0;
+    const pollInterval = setInterval(() => {
+      pollCount++;
+      if (pollCount > 90) { clearInterval(pollInterval); return; } // 3min timeout
+      // Check taskResults first (set by result capture hook)
+      const captured = taskResults.get(taskId);
+      if (captured) {
+        clearInterval(pollInterval);
+        taskResults.delete(taskId);
+        deliverRemoteResult(taskId, captured, deliverTo, callbackUrl);
+        return;
+      }
+      // Fallback: scan latest JSONL for assistant response containing taskId
+      try {
+        const sessionFile = require("path").join(jsonlDir, currentSessionId + ".jsonl");
+        if (!require("fs").existsSync(sessionFile)) return;
+        const stat = require("fs").statSync(sessionFile);
+        if (stat.size < lastInjectSize) return;
+        const content = require("fs").readFileSync(sessionFile, "utf8");
+        const lines = content.split("\n").filter(Boolean);
+        // Find assistant messages after our inject
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const entry = JSON.parse(lines[i]);
+            if (entry.type === "assistant" && entry.timestamp > injectTimestamp) {
+              const text = entry.message?.content?.map((c: any) => c.text || "").join("") || "";
+              if (text.length > 0) {
+                clearInterval(pollInterval);
+                deliverRemoteResult(taskId, text.slice(0, 2000), deliverTo, callbackUrl);
+                return;
+              }
+            }
+          } catch {}
+        }
+      } catch {}
+    }, 2000);
+  }
   const from = (envelope.chain?.length ? envelope.chain[envelope.chain.length - 1]?.agent : null) || "unknown";
   const origin = `${envelope.originInstructor}/${envelope.originSession}`;
   const chainStr = envelope.chain?.map((h) => h.agent).join(" → ") || "";
