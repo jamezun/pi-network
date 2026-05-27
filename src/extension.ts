@@ -345,6 +345,12 @@ function deliverRemoteResult(taskId: string, result: string, deliverTo: string, 
     }
   }
 }
+// Session display name — NEVER use config.localName for display
+// Only uses: env var > pi session name > PID-based name
+function myDisplayName(): string {
+  return process.env.PI_NETWORK_NAME || pi.getSessionName?.() || `session-${process.pid}`;
+}
+
 let showPeersInFooter = true;  // toggle with /network peers
 let peerLayout: "horizontal" | "vertical" = "horizontal";
 let networkSettings: NetworkSettings = loadNetworkSettings();
@@ -700,7 +706,7 @@ function startLocalBridge(port: number) {
     }
 
     if (req.method === "GET" && url.pathname === "/ping") {
-      res.end(JSON.stringify({ pong: true, name: config.localName }));
+      res.end(JSON.stringify({ pong: true, name: myDisplayName() }));
       return;
     }
 
@@ -736,7 +742,7 @@ function startLocalBridge(port: number) {
         }
       }
       res.end(JSON.stringify({
-        name: config.localName,
+        name: myDisplayName(),
         sessionName: pi.getSessionName?.() || "unknown",
         role: config.role,
         online: true, status: localStatus,
@@ -908,7 +914,7 @@ function startHeartbeat() {
       const ctx = (pi as any)._lastCtx;
       const contextPct = ctx?.getContextUsage?.()?.percent ?? 0;
       updateAgentInRegistry(agents, {
-        name: config.localName,
+        name: myDisplayName(),
         contextUsedPct: Math.round(contextPct),
         queueLength: concurrency.getQueueLength() + (idleQueue?.length ?? 0),
         activeTaskCount: concurrency.getRunningCount(),
@@ -917,8 +923,8 @@ function startHeartbeat() {
       // Phase 1.8: Broadcast presence via broker
       if (brokerClient?.isConnected()) {
         const pUpdate = presenceManager.updateContext(Math.round(contextPct), concurrency.getQueueLength(), concurrency.getRunningCount());
-        pUpdate.agent = config.localName;
-        brokerClient.updatePresence({ status: presenceManager.formatState(), model: normalizeModel(currentModel), name: pi.getSessionName?.() || config.localName });
+        pUpdate.agent = myDisplayName();
+        brokerClient.updatePresence({ status: presenceManager.formatState(), model: normalizeModel(currentModel), name: myDisplayName() });
       }
       // Refresh agents from broker (debounced)
       debouncedRefresh();
@@ -1021,7 +1027,7 @@ function injectTask(envelope: TaskEnvelope) {
   pi.sendUserMessage(
     `[📱 Remote task from ${from}]\n` +
     `Origin: ${origin}\n` +
-    `Chain: ${chainStr} → ${config.localName}\n` +
+    `Chain: ${chainStr} → ${myDisplayName()}\n` +
     `Root task: ${envelope.taskId.slice(0, 12)}\n` +
     `Hops: ${envelope.hops}/${config.maxHops}\n` +
     `Priority: ${envelope.priority}\n\n` +
@@ -1143,7 +1149,7 @@ export default function extension(api: ExtensionAPI) {
     currentSessionId = ctx.sessionManager.getSessionId();
     currentModel = ctx.model?.id ?? "unknown";
     // Push model change to broker immediately
-    if (brokerClient?.isConnected()) brokerClient.updatePresence({ model: normalizeModel(currentModel), name: pi.getSessionName?.() || config.localName });
+    if (brokerClient?.isConnected()) brokerClient.updatePresence({ model: normalizeModel(currentModel), name: myDisplayName() });
     sessionStartedAt = Date.now();
 
     // Apply CLI flag overrides
@@ -1274,7 +1280,7 @@ export default function extension(api: ExtensionAPI) {
     }
 
     updateAgentInRegistry(agents, {
-      name: config.localName, role: config.role,
+      name: myDisplayName(), role: config.role,
       capabilities: config.capabilities, specialties: config.specialties,
       manages: config.manages, reportTo: config.reportTo,
       status: "online",
@@ -1392,7 +1398,7 @@ export default function extension(api: ExtensionAPI) {
   pi.on("before_agent_start", async (event, _ctx) => {
     // Phase 1.8: Mark agent as thinking
     presenceManager.setThinking();
-    if (brokerClient) brokerClient.updatePresence({ status: "thinking", model: normalizeModel(currentModel), name: pi.getSessionName?.() || config.localName });
+    if (brokerClient) brokerClient.updatePresence({ status: "thinking", model: normalizeModel(currentModel), name: myDisplayName() });
 
     const tailnet = mode === "tailscale" || mode === "hybrid" ? getTailnetPeers() : null;
     const prompt = buildAgentPrompt(agents, config, mode, concurrency, localStatus, tailnet || undefined);
@@ -1426,7 +1432,7 @@ export default function extension(api: ExtensionAPI) {
 
     // Phase 1.8: Tool-level presence
     presenceManager.setToolExecuting(event.toolName);
-    if (brokerClient) brokerClient.updatePresence({ status: `tool:${event.toolName}`, model: normalizeModel(currentModel), name: pi.getSessionName?.() || config.localName });
+    if (brokerClient) brokerClient.updatePresence({ status: `tool:${event.toolName}`, model: normalizeModel(currentModel), name: myDisplayName() });
 
     // 2. File lock check for write/edit
     if (!["write", "edit"].includes(event.toolName)) return;
@@ -1531,7 +1537,7 @@ export default function extension(api: ExtensionAPI) {
 
     // Phase 1.2: Idle-aware delivery — flush queued messages when agent is idle
     presenceManager.setIdle();
-    if (brokerClient) brokerClient.updatePresence({ status: "idle", model: normalizeModel(currentModel), name: pi.getSessionName?.() || config.localName });
+    if (brokerClient) brokerClient.updatePresence({ status: "idle", model: normalizeModel(currentModel), name: myDisplayName() });
     if (idleQueue.length > 0) {
       idleQueue.sortByPriority();
       const pending = idleQueue.dequeueAll();
@@ -1952,7 +1958,7 @@ export default function extension(api: ExtensionAPI) {
     async execute(_id, params, _signal, onUpdate, _ctx) {
       const filter = params.filter || "online";
       const targets = agents.filter((a) => {
-        if (a.name === config.localName) return false;
+        if (a.name === myDisplayName()) return false;
         if ((a as any).runtime === "whatsapp") return false; // WhatsApp can't do tasks
         if (filter === "online") return a.status === "online" || a.status === "busy";
         if (filter === "all") return true;
@@ -2046,7 +2052,7 @@ export default function extension(api: ExtensionAPI) {
       } else {
         // Fall back to file-based registry
         for (const agent of agents) {
-          if (agent.name === config.localName) continue;
+          if (agent.name === myDisplayName()) continue;
           const icon = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : agent.status === "unresponsive" ? "🟠" : "🔴";
           const ctxBar = agent.contextUsedPct != null ? ` ${buildCtxBar(agent.contextUsedPct, null)}` : "";
           lines.push(`${icon} **${agent.name}**${ctxBar}`);
@@ -2071,7 +2077,7 @@ export default function extension(api: ExtensionAPI) {
       }
 
       const chainHead = (envelope.chain?.length ?? 0) > 0 ? envelope.chain[0] : null;
-      if (chainHead && chainHead.agent !== config.localName) {
+      if (chainHead && chainHead.agent !== myDisplayName()) {
         await transport.sendClarification(chainHead.agent, params.taskId, params.question);
         return { content: [{ type: "text", text: `💬 Sent clarification to ${chainHead.agent}. Waiting for answer...` }] };
       }
@@ -2124,7 +2130,7 @@ export default function extension(api: ExtensionAPI) {
       peer: Type.Optional(Type.String({ description: "Peer where task is running (omit for local)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      if (params.peer && params.peer !== config.localName) {
+      if (params.peer && params.peer !== myDisplayName()) {
         await transport.sendKill(params.peer, params.taskId);
         return { content: [{ type: "text", text: `☠️ Kill signal sent to ${params.peer} for task ${params.taskId.slice(0, 12)}` }] };
       }
@@ -2277,7 +2283,7 @@ export default function extension(api: ExtensionAPI) {
         if (!lock) {
           acquireLock({
             filePath: absolutePath, startLine: params.startLine, endLine: params.endLine,
-            agent: config.localName, session: pi.getSessionName?.() || "",
+            agent: myDisplayName(), session: pi.getSessionName?.() || "",
             taskId: "local-wait", rootTaskId: "local", since: Date.now(),
           }, config);
           return { content: [{ type: "text", text: `✅ Lock acquired: ${params.path} L${params.startLine}-${params.endLine}` }] };
@@ -2409,7 +2415,7 @@ export default function extension(api: ExtensionAPI) {
           return {
             content: [{ type: "text", text: 
               `Connected: ${connected ? `Yes (${currentSessionId?.slice(0, 8)})` : "No"}\n` +
-              `Session: ${pi.getSessionName?.() || config.localName}\n` +
+              `Session: ${myDisplayName()}\n` +
               `Runtime: ${detectRuntime()}\n` +
               `Peers: ${others.length > 0 ? others.map(s => { const rt = s.runtime || "?"; const m = (s.model || "?").replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, ""); return `${s.name || s.id.slice(0, 8)} [${rt}] ${m}`; }).join(", ") : "none"}\n` +
               `Pending asks: ${pending.length}${pending.length > 0 ? "\n" + pending.map(p => `  • ${p.from.name}: ${p.message.content.text.slice(0, 60)}...`).join("\n") : ""}`
@@ -3074,7 +3080,7 @@ export default function extension(api: ExtensionAPI) {
         // Force refresh for instant data
         refreshAgentsFromBroker();
         refreshRemotePeers();
-        const myName = pi.getSessionName?.() || config.localName;
+        const myName = myDisplayName();
         let status = `📡 **Network Status**\n`;
         status += `You: **${myName}** [${detectRuntime()}]\n`;
         status += `Broker: ${brokerClient?.isConnected() ? "connected" : "disconnected"}\n`;
@@ -3196,9 +3202,9 @@ export default function extension(api: ExtensionAPI) {
           ctx.ui.notify("❌ /network send requires interactive TUI", "warning");
           return;
         }
-        const currentName = pi.getSessionName?.() || config.localName;
+        const currentName = myDisplayName();
         const onlinePeers = agents.filter(a => 
-          a.name !== currentName && a.name !== config.localName && 
+          a.name !== currentName && 
           (a as any).runtime !== "whatsapp" &&
           (a.status === "online" || a.status?.includes("idle") || a.status?.includes("online"))
         );
@@ -3211,7 +3217,7 @@ export default function extension(api: ExtensionAPI) {
           // Step 1: Pick a peer
           const pick = await ctx.ui.custom<{ peer: AgentEntry } | undefined>(
             (_tui, theme, keybindings, done) =>
-              new PeerListOverlay(theme, keybindings, config.localName, onlinePeers, done),
+              new PeerListOverlay(theme, keybindings, myDisplayName(), onlinePeers, done),
             { overlay: true },
           );
           if (!pick?.peer) return;
@@ -3288,7 +3294,7 @@ export default function extension(api: ExtensionAPI) {
       const lines: string[] = [`\n🌐 Pi Network — ${mode.toUpperCase()} mode | project: ${projectFilter}\n`];
       let shown = 0;
       for (const agent of filtered) {
-        if (agent.name === config.localName) continue;
+        if (agent.name === myDisplayName()) continue;
         const icon = agent.status === "online" ? "🟢" : agent.status === "busy" ? "🟡" : agent.status === "unresponsive" ? "🟠" : "🔴";
         const ctxBar = agent.contextUsedPct != null ? ` [${agent.contextUsedPct}% ctx]` : "";
         const staleInfo = (agent.staleCount || 0) > 0 ? ` (stale: ${agent.staleCount})` : "";
@@ -3310,9 +3316,9 @@ export default function extension(api: ExtensionAPI) {
   pi.registerShortcut("alt+n", {
     description: "Open network compose (send message to mesh peer)",
     handler: async (ctx) => {
-      const currentName = pi.getSessionName?.() || config.localName;
+      const currentName = myDisplayName();
       const onlinePeers = agents.filter(a => 
-        a.name !== currentName && a.name !== config.localName && 
+        a.name !== currentName && 
         (a as any).runtime !== "whatsapp" &&
         (a.status === "online" || a.status?.includes("idle") || a.status?.includes("online"))
       );
@@ -3323,7 +3329,7 @@ export default function extension(api: ExtensionAPI) {
       try {
         const pick = await ctx.ui.custom<{ peer: AgentEntry } | undefined>(
           (_tui, theme, keybindings, done) =>
-            new PeerListOverlay(theme, keybindings, config.localName, onlinePeers, done),
+            new PeerListOverlay(theme, keybindings, myDisplayName(), onlinePeers, done),
           { overlay: true },
         );
         if (!pick?.peer) return;
