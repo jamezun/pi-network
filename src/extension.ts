@@ -1632,7 +1632,9 @@ export default function extension(api: ExtensionAPI) {
       const parsed = JSON.parse(message.content?.text || "");
       if (parsed.type === "task_route") {
         const envelope = parsed.envelope as TaskEnvelope;
+        debugLog("task_route from object: " + JSON.stringify(from).slice(0,200));
         (envelope as any)._forwarderSession = from.name || from.id;
+        debugLog("task_route forwarder: name=" + from.name + " id=" + from.id);
         debugLog("received task_route for " + envelope.taskId + " from " + from.name);
         injectTask(envelope);
         return;
