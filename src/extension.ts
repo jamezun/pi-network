@@ -306,6 +306,8 @@ function debugLog(msg: string) {
   try { require("fs").appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch(_e) {}
 }
 const taskResults: Map<string, string> = new Map();
+const resultsDir = require("path").join(require("os").homedir(), ".pi/agent/intercom/results");
+try { require("fs").mkdirSync(resultsDir, { recursive: true }); } catch {}
 
 let lastInjectSize = 0;
 let injectTimestamp = 0;
@@ -1031,6 +1033,18 @@ function injectTask(envelope: TaskEnvelope) {
         deliverRemoteResult(taskId, captured, deliverTo, callbackUrl, (activeEnvelopes.get(taskId) as any)?._forwarderSession);
         return;
       }
+      // Also check result file (cross-session exchange)
+      const resultFile = require("path").join(resultsDir, taskId + ".json");
+      try {
+        if (require("fs").existsSync(resultFile)) {
+          const data = JSON.parse(require("fs").readFileSync(resultFile, "utf8"));
+          clearInterval(pollInterval);
+          require("fs").unlinkSync(resultFile);
+          taskResults.set(taskId, data.result);
+          deliverRemoteResult(taskId, data.result, deliverTo, callbackUrl, (activeEnvelopes.get(taskId) as any)?._forwarderSession);
+          return;
+        }
+      } catch {}
       // Fallback: scan latest JSONL for assistant response containing taskId
       try {
         const sessionFile = findJsonlFile(currentSessionId);
@@ -1053,6 +1067,8 @@ function injectTask(envelope: TaskEnvelope) {
               const text = entry.message?.content?.filter((c: any) => c.type === "text").map((c: any) => c.text || "").join("") || "";
               if (text.length > 0) {
                 clearInterval(pollInterval);
+                // Write result file for cross-session exchange
+                try { require("fs").writeFileSync(require("path").join(resultsDir, taskId + ".json"), JSON.stringify({ taskId, result: text.slice(0, 2000), from: myDisplayName(), ts: Date.now() })); } catch {}
                 deliverRemoteResult(taskId, text.slice(0, 2000), deliverTo, callbackUrl, (activeEnvelopes.get(taskId) as any)?._forwarderSession);
                 return;
               }
