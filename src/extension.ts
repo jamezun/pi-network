@@ -1060,6 +1060,8 @@ function injectTask(envelope: TaskEnvelope) {
       } catch {}
     }, 2000);
   }
+  try { const jf = findJsonlFile(currentSessionId); if (jf) lastInjectSize = require("fs").statSync(jf).size; } catch {}
+  injectTimestamp = Date.now();
   const from = (envelope.chain?.length ? envelope.chain[envelope.chain.length - 1]?.agent : null) || "unknown";
   const origin = `${envelope.originInstructor}/${envelope.originSession}`;
   const chainStr = envelope.chain?.map((h) => h.agent).join(" → ") || "";
