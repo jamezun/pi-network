@@ -1034,7 +1034,7 @@ function injectTask(envelope: TaskEnvelope) {
       // Fallback: scan latest JSONL for assistant response containing taskId
       try {
         const sessionFile = findJsonlFile(currentSessionId);
-        if (pollCount === 5) debugLog("poll5 " + taskId + " file=" + sessionFile + " size=" + (sessionFile ? require("fs").statSync(sessionFile).size : 0) + " lastSize=" + lastInjectSize);
+        if (pollCount >= 4 && pollCount <= 6) debugLog("poll" + pollCount + " " + taskId + " file=" + sessionFile + " size=" + (sessionFile ? require("fs").statSync(sessionFile).size : 0) + " lastSize=" + lastInjectSize);
         if (pollCount <= 3) debugLog("poll " + taskId + ": file=" + sessionFile + " sessionId=" + currentSessionId + " ts=" + injectTimestamp);
         if (!require("fs").existsSync(sessionFile)) return;
         const stat = require("fs").statSync(sessionFile);
@@ -1048,7 +1048,7 @@ function injectTask(envelope: TaskEnvelope) {
             if (entry.type === "message" && entry.message?.role === "assistant") {
             const entryTs = new Date(entry.timestamp).getTime();
             if (pollCount <= 3) debugLog("poll found assistant msg: ts=" + entryTs + " injectTs=" + injectTimestamp + " match=" + (entryTs > injectTimestamp));
-            if (pollCount === 5) debugLog("poll5 match: entryTs=" + entryTs + " injectTs=" + injectTimestamp + " textLen=" + entry.message?.content?.filter((c: any) => c.type === "text").map((c: any) => c.text || "").join("").length);
+            if (pollCount >= 4 && pollCount <= 6) debugLog("poll" + pollCount + " found assistant: entryTs=" + entryTs + " > injectTs=" + injectTimestamp + "=" + (entryTs > injectTimestamp) + " textLen=" + entry.message?.content?.filter((c: any) => c.type === "text").map((c: any) => c.text || "").join("").length);
             if (entryTs <= injectTimestamp) continue;
               const text = entry.message?.content?.filter((c: any) => c.type === "text").map((c: any) => c.text || "").join("") || "";
               if (text.length > 0) {
