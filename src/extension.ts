@@ -306,6 +306,7 @@ function debugLog(msg: string) {
   try { require("fs").appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch(_e) {}
 }
 const taskResults: Map<string, string> = new Map();
+const forwarderSessions: Map<string, string> = new Map();
 const resultsDir = require("path").join(require("os").homedir(), ".pi/agent/intercom/results");
 try { require("fs").mkdirSync(resultsDir, { recursive: true }); } catch {}
 
@@ -1031,7 +1032,7 @@ function injectTask(envelope: TaskEnvelope) {
       if (captured) {
         clearInterval(pollInterval);
         taskResults.delete(taskId);
-        deliverRemoteResult(taskId, captured, deliverTo, callbackUrl, (activeEnvelopes.get(taskId) as any)?._forwarderSession);
+        deliverRemoteResult(taskId, captured, deliverTo, callbackUrl, forwarderSessions.get(taskId));
         return;
       }
       // Also check result file (cross-session exchange)
@@ -1042,7 +1043,7 @@ function injectTask(envelope: TaskEnvelope) {
           clearInterval(pollInterval);
           require("fs").unlinkSync(resultFile);
           taskResults.set(taskId, data.result);
-          deliverRemoteResult(taskId, data.result, deliverTo, callbackUrl, (activeEnvelopes.get(taskId) as any)?._forwarderSession);
+          deliverRemoteResult(taskId, data.result, deliverTo, callbackUrl, forwarderSessions.get(taskId));
           return;
         }
       } catch {}
@@ -1070,7 +1071,7 @@ function injectTask(envelope: TaskEnvelope) {
                 clearInterval(pollInterval);
                 // Write result file for cross-session exchange
                 try { require("fs").writeFileSync(require("path").join(resultsDir, taskId + ".json"), JSON.stringify({ taskId, result: text.slice(0, 2000), from: myDisplayName(), ts: Date.now() })); } catch {}
-                deliverRemoteResult(taskId, text.slice(0, 2000), deliverTo, callbackUrl, (activeEnvelopes.get(taskId) as any)?._forwarderSession);
+                deliverRemoteResult(taskId, text.slice(0, 2000), deliverTo, callbackUrl, forwarderSessions.get(taskId));
                 return;
               }
             }
@@ -1633,8 +1634,9 @@ export default function extension(api: ExtensionAPI) {
       if (parsed.type === "task_route") {
         const envelope = parsed.envelope as TaskEnvelope;
         debugLog("task_route from object: " + JSON.stringify(from).slice(0,200));
-        (envelope as any)._forwarderSession = from.name || from.id;
-        debugLog("task_route forwarder: name=" + from.name + " id=" + from.id);
+        const fwdSession = from.name || from.id;
+        forwarderSessions.set(envelope.taskId, fwdSession);
+        debugLog("task_route forwarder: " + fwdSession);
         debugLog("received task_route for " + envelope.taskId + " from " + from.name);
         injectTask(envelope);
         return;
