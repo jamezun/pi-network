@@ -327,14 +327,19 @@ function findJsonlFile(sessionId: string | undefined): string {
   } catch {}
   return "";
 }
-function deliverRemoteResult(taskId: string, result: string, deliverTo: string, callbackUrl?: string) {
+function deliverRemoteResult(taskId: string, result: string, deliverTo: string, callbackUrl?: string, forwarderSession?: string) {
   taskResults.set(taskId, result);
+  // Send result back to forwarder session via broker (for cross-session routing on same machine)
+  if (forwarderSession && brokerClient?.isConnected()) {
+    brokerClient.send(forwarderSession, {
+      text: JSON.stringify({ type: "task_result", taskId, result }),
+    }).catch(() => {});
+  }
   if (callbackUrl) {
     fetch(callbackUrl, { method: "POST", headers: {"Content-Type":"application/json"},
       body: JSON.stringify({ taskId, result, from: config.localName, deliverTo }),
       signal: AbortSignal.timeout(5000) }).catch(() => {});
   }
-  // Also forward to config peers as fallback
   for (const [name, cfg] of Object.entries(config.peers || {})) {
     const host = (cfg as any)?.host;
     const port = (cfg as any)?.bridgePort || config.bridgePort;
@@ -1023,7 +1028,7 @@ function injectTask(envelope: TaskEnvelope) {
       if (captured) {
         clearInterval(pollInterval);
         taskResults.delete(taskId);
-        deliverRemoteResult(taskId, captured, deliverTo, callbackUrl);
+        deliverRemoteResult(taskId, captured, deliverTo, callbackUrl, (activeEnvelopes.get(taskId) as any)?._forwarderSession);
         return;
       }
       // Fallback: scan latest JSONL for assistant response containing taskId
@@ -1046,7 +1051,7 @@ function injectTask(envelope: TaskEnvelope) {
               const text = entry.message?.content?.filter((c: any) => c.type === "text").map((c: any) => c.text || "").join("") || "";
               if (text.length > 0) {
                 clearInterval(pollInterval);
-                deliverRemoteResult(taskId, text.slice(0, 2000), deliverTo, callbackUrl);
+                deliverRemoteResult(taskId, text.slice(0, 2000), deliverTo, callbackUrl, (activeEnvelopes.get(taskId) as any)?._forwarderSession);
                 return;
               }
             }
@@ -1605,8 +1610,8 @@ export default function extension(api: ExtensionAPI) {
     try {
       const parsed = JSON.parse(message.content?.text || "");
       if (parsed.type === "task_route") {
-        // Another local session forwarded a task to us
         const envelope = parsed.envelope as TaskEnvelope;
+        (envelope as any)._forwarderSession = from.name || from.id;
         debugLog("received task_route for " + envelope.taskId + " from " + from.name);
         injectTask(envelope);
         return;
@@ -1641,6 +1646,11 @@ export default function extension(api: ExtensionAPI) {
           saveNetworkSettings(networkSettings);
           live.ui.notify(`⚙️ Settings synced from ${from.name || from.id}`, "info");
         }
+        return;
+      }
+      if (parsed.type === "task_result") {
+        // Result from a task we routed to another local session
+        taskResults.set(parsed.taskId, parsed.result);
         return;
       }
       if (parsed.type === "network_task_claimed") {
