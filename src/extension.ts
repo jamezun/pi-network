@@ -767,8 +767,8 @@ function startLocalBridge(port: number) {
       if (targetPeer && targetPeer !== myName && brokerClient?.isConnected()) {
         try {
           const brokerResult = await brokerClient.send(targetPeer, {
-            text: JSON.stringify(envelope),
-            expectsReply: !!req.headers["x-wait-for-response"],
+            text: JSON.stringify({ type: "task_route", envelope }),
+            expectsReply: false, // Task routing doesn't use broker reply
             taskId: envelope.taskId,
           });
           if (req.headers["x-wait-for-response"]) {
@@ -1601,9 +1601,16 @@ export default function extension(api: ExtensionAPI) {
     const live = getLiveContext(ctx, msgGen);
     if (!live) return;
 
-    // Handle network protocol messages (JSON-encoded)
+    // Handle task routing from local HTTP bridge
     try {
       const parsed = JSON.parse(message.content?.text || "");
+      if (parsed.type === "task_route") {
+        // Another local session forwarded a task to us
+        const envelope = parsed.envelope as TaskEnvelope;
+        debugLog("received task_route for " + envelope.taskId + " from " + from.name);
+        injectTask(envelope);
+        return;
+      }
       if (parsed.type === "network_task_available") {
         // Auto-claim if this peer is in the autoClaimPeers list
         if (networkSettings.autoClaimPeers.includes(config.localName) ||
