@@ -12,6 +12,7 @@ import { WhatsAppTransport } from "./whatsapp";
 export interface SendResult {
   delivered: boolean;
   queued: boolean;
+  result?: string; // Agent response text (when sync mode)
 }
 
 export interface Transport {

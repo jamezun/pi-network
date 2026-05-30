@@ -23,9 +23,17 @@ export class TailscaleTransport implements Transport {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Target-Peer": peer, "X-Sender-Host": this.config.localHost || "127.0.0.1", "X-Sender-Port": String(this.config.bridgePort), "X-Wait-For-Response": "true" },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(120000), // 2min — wait for agent response
       });
-      if (res.ok) return { delivered: true, queued: false };
+      if (res.ok) {
+        try {
+          const body: any = await res.json();
+          if (body.status === "completed" && body.result) {
+            return { delivered: true, queued: false, result: body.result };
+          }
+        } catch {}
+        return { delivered: true, queued: false };
+      }
       throw new Error(`HTTP ${res.status}`);
     } catch {
       pushToOutbox(peer, payload);

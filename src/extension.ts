@@ -760,17 +760,53 @@ function startLocalBridge(port: number) {
 
     if (req.method === "POST" && url.pathname === "/task") {
       const envelope: TaskEnvelope = body;
-      // For remote tasks with deliverTo: wait for agent response and return it
+      const targetPeer = (req.headers["x-target-peer"] as string | undefined) || "";
+      const myName = myDisplayName();
+
+      // If target is a different local session, route via broker
+      if (targetPeer && targetPeer !== myName && brokerClient?.isConnected()) {
+        try {
+          const brokerResult = await brokerClient.send(targetPeer, {
+            text: JSON.stringify(envelope),
+            expectsReply: !!req.headers["x-wait-for-response"],
+            taskId: envelope.taskId,
+          });
+          if (req.headers["x-wait-for-response"]) {
+            // Wait for the target session to process and reply
+            const responsePromise = new Promise<string>((resolve) => {
+              const timer = setTimeout(() => resolve("(timeout - target session did not respond)"), 60000);
+              const checkInterval = setInterval(() => {
+                const result = taskResults.get(envelope.taskId);
+                if (result) {
+                  clearTimeout(timer); clearInterval(checkInterval);
+                  taskResults.delete(envelope.taskId);
+                  resolve(result);
+                }
+              }, 500);
+            });
+            const response = await responsePromise;
+            res.end(JSON.stringify({ accepted: true, status: "completed", result: response }));
+          } else {
+            res.end(JSON.stringify({ accepted: true, status: "routed", target: targetPeer, delivered: brokerResult.delivered }));
+          }
+        } catch (e: any) {
+          // Broker send failed, fall through to injectTask as fallback
+          debugLog("broker route to " + targetPeer + " failed: " + e.message + ", injecting locally");
+          injectTask(envelope);
+          res.end(JSON.stringify({ accepted: true, status: "running", note: "broker route failed, injected locally" }));
+        }
+        return;
+      }
+
+      // Direct delivery to this session
       if (envelope.deliverTo && envelope.deliverTo !== config.localName && req.headers["x-wait-for-response"]) {
-        // Synchronous mode: inject task, wait up to 60s for response
         injectTask(envelope);
         const responsePromise = new Promise<string>((resolve) => {
           const timer = setTimeout(() => resolve("(timeout)"), 60000);
           const checkInterval = setInterval(() => {
             const result = taskResults.get(envelope.taskId);
             if (result) {
-              clearTimeout(timer);
-              clearInterval(checkInterval);
+              clearTimeout(timer); clearInterval(checkInterval);
               taskResults.delete(envelope.taskId);
               resolve(result);
             }
@@ -778,13 +814,12 @@ function startLocalBridge(port: number) {
         });
         const response = await responsePromise;
         res.end(JSON.stringify({ accepted: true, status: "completed", result: response }));
-        // Also forward result to callback URL if provided
         const senderHost = req.headers["x-sender-host"] as string | undefined;
         if (senderHost) {
           const senderPort = (req.headers["x-sender-port"] as string | undefined) || config.bridgePort;
           const callbackUrl = "http://" + senderHost + ":" + senderPort + "/result";
           fetch(callbackUrl, { method: "POST", headers: {"Content-Type":"application/json"},
-            body: JSON.stringify({ taskId: envelope.taskId, result: response, from: config.localName, deliverTo: envelope.deliverTo }),
+            body: JSON.stringify({ taskId: envelope.taskId, result: response, from: myName, deliverTo: envelope.deliverTo }),
             signal: AbortSignal.timeout(5000) }).catch(() => {});
         }
         return;

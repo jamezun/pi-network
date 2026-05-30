@@ -259,7 +259,12 @@ export class WhatsAppBridge {
           }
         }
         if (result.delivered) {
-          await this.sendReply(from, `📤 Task sent to ${parsed.peer}. Result will follow.`);
+          if ((result as any).result) {
+            const replyText = (result as any).result as string;
+            await this.sendReply(from, `📬 ${parsed.peer}: ${replyText.slice(0, 1000)}`);
+          } else {
+            await this.sendReply(from, `📤 Task sent to ${parsed.peer}. Result will follow.`);
+          }
         } else {
           await this.sendReply(from, formatOfflinePeer(parsed.peer));
         }
