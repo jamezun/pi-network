@@ -330,6 +330,7 @@ function findJsonlFile(sessionId: string | undefined): string {
   return "";
 }
 function deliverRemoteResult(taskId: string, result: string, deliverTo: string, callbackUrl?: string, forwarderSession?: string) {
+  debugLog("deliverRemoteResult: " + taskId + " result=" + result.slice(0,50) + " forwarder=" + forwarderSession + " broker=" + !!brokerClient?.isConnected());
   taskResults.set(taskId, result);
   // Send result back to forwarder session via broker (for cross-session routing on same machine)
   if (forwarderSession && brokerClient?.isConnected()) {
@@ -1669,7 +1670,7 @@ export default function extension(api: ExtensionAPI) {
         return;
       }
       if (parsed.type === "task_result") {
-        // Result from a task we routed to another local session
+        debugLog("received task_result: " + parsed.taskId + " result=" + (parsed.result || "").slice(0,50));
         taskResults.set(parsed.taskId, parsed.result);
         return;
       }
