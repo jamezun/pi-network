@@ -429,7 +429,7 @@ function refreshAgentsFromBroker() {
       .filter((s: any) => s.status !== "external")
       .map((s: any) => ({
         name: s.name || s.id.slice(0, 8),
-        status: s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("\ud83d\udfe2") ? "online" as const : s.status?.includes("busy") || s.status?.includes("tool:") ? "busy" as const : "offline" as const,
+        status: s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("\ud83d\udfe2") ? "online" as const : s.status?.includes("busy") || s.status?.includes("tool:") || s.status?.includes("thinking") || s.status?.startsWith("\ud83d\udfe1") ? "busy" as const : "offline" as const,
         rawStatus: s.status,
         runtime: s.runtime || "pi",
         model: s.model,
@@ -2118,7 +2118,7 @@ export default function extension(api: ExtensionAPI) {
         const others = brokerSessions.filter(s => s.id !== currentSessionId);
         if (others.length === 0) lines.push("No other sessions online.");
         for (const s of others) {
-          const icon = (s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("🟢")) ? "🟢" : (s.status?.includes("busy") || s.status?.includes("tool:")) ? "🟡" : "🔴";
+          const icon = (s.status?.includes("online") || s.status?.includes("idle") || s.status?.startsWith("🟢")) ? "🟢" : (s.status?.includes("busy") || s.status?.includes("tool:") || s.status?.includes("thinking")) ? "🟡" : "🔴";
           const rt = s.runtime === "claude" ? "claude" : s.runtime === "pi" ? "pi" : "?";
           const model = s.model || "?";
           const shortModel = model.replace(/^(anthropic\/|openai\/|google\/|x-ai\/|meta\/)/, "");
