@@ -261,7 +261,7 @@ export class WhatsAppBridge {
         if (result.delivered) {
           if ((result as any).result) {
             const replyText = (result as any).result as string;
-            await this.sendReply(from, `📬 ${parsed.peer}: ${replyText.slice(0, 1000)}`);
+            await this.sendReply(from, `📬 ${parsed.peer}: ${replyText}`);
           } else {
             await this.sendReply(from, `📤 Task sent to ${parsed.peer}. Result will follow.`);
           }
@@ -405,8 +405,37 @@ export class WhatsAppBridge {
   private knownPeers: string[] = [];
 
   private async sendReply(from: string, text: string): Promise<void> {
-    console.log(`WhatsAppBridge.sendReply: to=${from} text=${text.substring(0, 50)}`);
-    // Route through WhatsApp transport
+    console.log(`WhatsAppBridge.sendReply: to=${from} len=${text.length}`);
+    // Auto-split if message exceeds maxMessageLength
+    const maxLen = this.waConfig.maxMessageLength || 4096;
+    if (text.length <= maxLen) {
+      await this.sendRawReply(from, text);
+      return;
+    }
+    // Split on newlines to keep coherence
+    const chunks: string[] = [];
+    let remaining = text;
+    while (remaining.length > 0) {
+      if (remaining.length <= maxLen) {
+        chunks.push(remaining);
+        break;
+      }
+      // Find last newline before maxLen
+      let splitAt = remaining.lastIndexOf("\n", maxLen);
+      if (splitAt < maxLen * 0.5) splitAt = remaining.lastIndexOf(" ", maxLen); // fallback to last space
+      if (splitAt < maxLen * 0.3) splitAt = maxLen; // hard cut if no good break point
+      chunks.push(remaining.slice(0, splitAt));
+      remaining = remaining.slice(splitAt).replace(/^\n/, "");
+    }
+    for (let i = 0; i < chunks.length; i++) {
+      const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}] ` : "";
+      await this.sendRawReply(from, prefix + chunks[i]);
+      // Small delay between chunks to avoid rate limiting
+      if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 300));
+    }
+  }
+
+  private async sendRawReply(from: string, text: string): Promise<void> {
     try {
       const res = await fetch(`${this.waConfig.evolutionApiUrl}/message/sendText/${this.waConfig.instanceName}`, {
         method: "POST",
