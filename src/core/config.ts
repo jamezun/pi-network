@@ -221,7 +221,9 @@ export function getPeerUrl(peerName: string, config: BridgeConfig): string {
       const port = dyn.bridgePort || config.bridgePort;
       return `http://${dyn.host}:${port}`;
     }
-    throw new Error(`Unknown peer: ${peerName}`);
+    // Fallback: treat as local peer on same machine (localhost)
+    const port = config.bridgePort || 9764;
+    return `http://127.0.0.1:${port}`;
   }
   const port = peer.bridgePort || config.bridgePort;
   // Use explicit host if configured, otherwise try Tailscale DNS match, fall back to peerName

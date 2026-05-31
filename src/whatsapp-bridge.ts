@@ -228,35 +228,16 @@ export class WhatsAppBridge {
       userId: from,
     };
 
-    // Route: check if peer is local (broker) or remote (HTTP transport)
-        console.log(`[WA-bridge] handleTask: peer=${parsed.peer}, brokerConnected=${!!this.brokerClient?.isConnected?.()}`);
-        const liveAgents = this.getLiveAgents?.() || [];
-        const targetAgent = liveAgents.find((a: any) => a.name.toLowerCase() === parsed.peer.toLowerCase());
-        const isLocalPeer = this.brokerClient?.isConnected() && 
-          targetAgent && !targetAgent.remote;
-        console.log(`[WA-bridge] targetAgent: ${JSON.stringify({name: targetAgent?.name, remote: targetAgent?.remote, status: targetAgent?.status})}, isLocal=${isLocalPeer}`);
+    // Route via HTTP transport (handles both local and remote with X-Target-Peer)
+        console.log(`[WA-bridge] handleTask: peer=${parsed.peer}`);
         let result: { delivered: boolean; queued?: boolean };
         try {
-          if (isLocalPeer) {
-            // Local session — deliver via broker
-            const brokerResult = await this.brokerClient.send(parsed.peer, { text: parsed.task, expectsReply: true, taskId: envelope.taskId });
-            result = { delivered: brokerResult?.delivered ?? false, queued: false };
-          } else {
-            // Remote peer — deliver via HTTP transport (TailscaleTransport with X-Target-Peer)
-            result = await this.meshTransport.send(parsed.peer, envelope);
-          }
+          // Always use HTTP transport — it handles both local and remote routing
+          // with proper task injection, X-Target-Peer routing, and result capture
+          result = await this.meshTransport.send(parsed.peer, envelope);
         } catch (e: any) {
-          // First path failed, try the other
-          try {
-            if (isLocalPeer) {
-              result = await this.meshTransport.send(parsed.peer, envelope);
-            } else {
-              result = await this.meshTransport.send(parsed.peer, envelope);
-            }
-          } catch (e2: any) {
-            await this.sendReply(from, formatError("Failed to deliver: " + e2.message));
-            return;
-          }
+          await this.sendReply(from, formatError("Failed to deliver: " + e.message));
+          return;
         }
         if (result.delivered) {
           if ((result as any).result) {
