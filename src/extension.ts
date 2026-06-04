@@ -1674,16 +1674,11 @@ export default function extension(api: ExtensionAPI) {
         return; // Don't display as regular message
       }
       if (parsed.type === "network_settings_update") {
-        // Merge remote settings (union of autoClaimPeers)
+        // REPLACE settings with remote (latest writer wins, not union)
         const remote = parsed.settings as NetworkSettings;
         if (remote) {
           networkSettings.enableTaskBoard = remote.enableTaskBoard;
-          // Union: add any new peers from remote, keep ours
-          for (const p of (remote.autoClaimPeers || [])) {
-            if (!networkSettings.autoClaimPeers.includes(p)) {
-              networkSettings.autoClaimPeers.push(p);
-            }
-          }
+          networkSettings.autoClaimPeers = [...(remote.autoClaimPeers || [])];
           saveNetworkSettings(networkSettings);
           live.ui.notify(`⚙️ Settings synced from ${from.name || from.id}`, "info");
         }
