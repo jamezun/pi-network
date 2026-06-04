@@ -363,6 +363,25 @@ function myDisplayName(): string {
 let showPeersInFooter = true;  // toggle with /network peers
 let peerLayout: "horizontal" | "vertical" = "horizontal";
 let networkSettings: NetworkSettings = loadNetworkSettings();
+// Check if peer is allowed to receive delegated work (auto-claim list)
+// Returns { ok: true } or { ok: false, reason: string }
+function checkDelegationAllowed(peer: string): { ok: boolean; reason?: string } {
+  // Reload settings (in case file changed)
+  const settings = loadNetworkSettings();
+  const list = settings.autoClaimPeers || [];
+  if (list.length === 0) {
+    return { ok: false, reason: "No auto-claim peers configured. Use /network settings or /network settings via TUI to enable peers." };
+  }
+  const normalized = list.map(s => s.toLowerCase());
+  if (normalized.includes(peer.toLowerCase())) return { ok: true };
+  if (peer === "all" || peer === "broadcast") {
+    // Broadcast allowed only if list non-empty (already checked)
+    return { ok: true };
+  }
+  return { ok: false, reason: `Peer '${peer}' is not in auto-claim list. Allowed: ${list.join(", ")}` };
+}
+
+
 let lastRefreshTime = 0;
 let refreshPending = false;
 function debouncedRefresh() {
@@ -1780,6 +1799,12 @@ export default function extension(api: ExtensionAPI) {
     async execute(_id, params, _signal, onUpdate, ctx) {
       const { peer, task, mode: taskMode, priority, response_schema } = params;
 
+      // Phase: enforce auto-claim list (only allow delegated work to enabled peers)
+      const allowed = checkDelegationAllowed(peer);
+      if (!allowed.ok) {
+        return { content: [{ type: "text", text: "🚫 " + allowed.reason }], isError: true };
+      }
+
       // Hop limit check
       const hopCheck = withinHopLimit(
         createEnvelope({ task, from: config.localName, fromSession: pi.getSessionName?.() || "unknown", deliverTo: config.localName }),
@@ -1861,7 +1886,7 @@ export default function extension(api: ExtensionAPI) {
     parameters: Type.Object({
       taskId: Type.String({ description: "taskId returned by task_send" }),
     }),
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
+    async execute(_id, params, signal, _onUpdate, _ctx) {
       const pending = pendingTasks.get(params.taskId);
       if (!pending) {
         // Check history
@@ -1914,18 +1939,36 @@ export default function extension(api: ExtensionAPI) {
         return { content: [{ type: "text", text: `✅ Complete from ${pending.result.from}:\n${pending.result.result}` }] };
       }
 
-      // Wait for result
+      // Wait for result (ESC-cancellable)
       const timeoutMs = params.timeout_ms || 1_800_000;
       return new Promise((resolve) => {
+        let cancelled = false;
+        const onCancel = () => {
+          if (cancelled) return;
+          cancelled = true;
+          clearTimeout(timer);
+          resolve({ content: [{ type: "text", text: `🛑 Cancelled by user (ESC). Task ${params.taskId.slice(0, 8)} may still be running.` }] });
+        };
+
         const timer = setTimeout(() => {
+          if (cancelled) return;
+          cancelled = true;
           resolve({ content: [{ type: "text", text: `⏰ Timeout after ${Math.round(timeoutMs / 1000)}s waiting for ${params.taskId.slice(0, 12)}` }] });
         }, timeoutMs);
 
+        if (signal) {
+          if ((signal as any).aborted) { onCancel(); return; }
+          (signal as any).addEventListener?.("abort", onCancel);
+        }
+
         pending.resolve = (result: TaskResult) => {
+          if (cancelled) return;
+          cancelled = true;
           clearTimeout(timer);
-          resolve({ content: [{ type: "text", text: `✅ Response from ${result.from}:\n${result.result}` }] });
+          resolve({ content: [{ type: "text", text: `✅ Response from ${result.from}:
+${result.result}` }] });
         };
-      });
+      })
     },
   });
 
@@ -1942,8 +1985,14 @@ export default function extension(api: ExtensionAPI) {
       mode: Type.Optional(StringEnum(["agent", "inbox", "raw"] as const)),
       priority: Type.Optional(StringEnum(["urgent", "high", "normal", "low"] as const)),
     }),
-    async execute(_id, params, _signal, onUpdate, ctx) {
+    async execute(_id, params, signal, onUpdate, ctx) {
       const { peer, task, mode: taskMode, priority } = params;
+
+      // Phase: enforce auto-claim list
+      const allowed = checkDelegationAllowed(peer);
+      if (!allowed.ok) {
+        return { content: [{ type: "text", text: "🚫 " + allowed.reason }], isError: true };
+      }
 
       // Hop limit
       const hopCheck = withinHopLimit(
@@ -1993,6 +2042,7 @@ export default function extension(api: ExtensionAPI) {
       }
 
       // Wait for result (inline await, 10 min timeout)
+      // ESC-cancellable wait
       return new Promise((resolve) => {
         const pending: PendingTask = {
           taskId: envelope.taskId, msgId: ulid(), targetPeer: peer,
@@ -2000,17 +2050,35 @@ export default function extension(api: ExtensionAPI) {
         };
         pendingTasks.set(envelope.taskId, pending);
 
+        let cancelled = false;
+        const onCancel = () => {
+          if (cancelled) return;
+          cancelled = true;
+          clearTimeout(pending.timer!);
+          pendingTasks.delete(envelope.taskId);
+          resolve({ content: [{ type: "text", text: `🛑 Cancelled by user (ESC). Task ${envelope.taskId.slice(0, 8)} may still be running on ${peer}.` }] });
+        };
+        if (signal) {
+          if ((signal as any).aborted) { onCancel(); return; }
+          (signal as any).addEventListener?.("abort", onCancel);
+        }
+
         pending.timer = setTimeout(() => {
+          if (cancelled) return;
+          cancelled = true;
           pendingTasks.delete(envelope.taskId);
           resolve({ content: [{ type: "text", text: `⏰ Timeout waiting for ${peer} response.` }] });
         }, 600_000);
 
         pending.resolve = (result: TaskResult) => {
+          if (cancelled) return;
+          cancelled = true;
           clearTimeout(pending.timer!);
           pendingTasks.delete(envelope.taskId);
-          resolve({ content: [{ type: "text", text: `✅ Result from ${result.from}:\n${result.result}` }] });
+          resolve({ content: [{ type: "text", text: `✅ Result from ${result.from}:
+${result.result}` }] });
         };
-      });
+      })
     },
     renderCall(args: any, theme: any) {
       const tgt = args.peer ?? "?";
@@ -2538,6 +2606,13 @@ export default function extension(api: ExtensionAPI) {
 
         case "send": {
           if (!to || !message) return { content: [{ type: "text", text: "❌ 'to' and 'message' required for send" }], isError: true };
+          // Enforce auto-claim list (skip for WhatsApp - user explicitly typed the number)
+          if (!isWhatsAppTarget(to)) {
+            const allowed = checkDelegationAllowed(to);
+            if (!allowed.ok) {
+              return { content: [{ type: "text", text: "🚫 " + allowed.reason }], isError: true };
+            }
+          }
           // WhatsApp routing
           if (isWhatsAppTarget(to)) {
             const files = attachments?.map(a => ({ name: a.name, content: a.content }));
@@ -2563,6 +2638,13 @@ export default function extension(api: ExtensionAPI) {
 
         case "ask": {
           if (!to || !message) return { content: [{ type: "text", text: "❌ 'to' and 'message' required for ask" }], isError: true };
+          // Enforce auto-claim list (skip for WhatsApp)
+          if (!isWhatsAppTarget(to)) {
+            const allowed = checkDelegationAllowed(to);
+            if (!allowed.ok) {
+              return { content: [{ type: "text", text: "🚫 " + allowed.reason }], isError: true };
+            }
+          }
           // WhatsApp: send but can't await reply from a phone user
           if (isWhatsAppTarget(to)) {
             const files = attachments?.map(a => ({ name: a.name, content: a.content }));
