@@ -1377,7 +1377,10 @@ export default function extension(api: ExtensionAPI) {
 
     // ─── Pool Widget ───
     ctx.ui.setWidget("pi-network-pool", (_tui: any, theme: any) => {
+      // Return proper Component instance with render/invalidate/handleInput
       return {
+        invalidate() {},
+        handleInput(_data: string) {},
         render(width: number) {
           if (!showPeersInFooter) return [""];
           if (agents.length === 0) return [theme.fg("dim", "  🌐 Discovering peers...")];
@@ -1421,7 +1424,7 @@ export default function extension(api: ExtensionAPI) {
           if (currentLine.trim()) lines.push(currentLine);
           return lines;
         },
-      };
+      } as any;
     });
 
 
@@ -1846,7 +1849,7 @@ export default function extension(api: ExtensionAPI) {
       const tgt = args.peer ?? "?";
       const prompt = args.task ?? "";
       const preview = prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt;
-      return theme.fg("toolTitle", theme.bold("task_send ")) + theme.fg("accent", tgt) + " " + theme.fg("dim", preview);
+      return new Text(theme.fg("toolTitle", theme.bold("task_send ")) + theme.fg("accent", tgt) + " " + theme.fg("dim", preview), 0, 0);
     },
   });
 
