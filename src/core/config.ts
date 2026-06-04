@@ -221,7 +221,8 @@ export function getPeerUrl(peerName: string, config: BridgeConfig): string {
       const port = dyn.bridgePort || config.bridgePort;
       return `http://${dyn.host}:${port}`;
     }
-    // Fallback: treat as local peer on same machine (localhost)
+    // No config or dynamic entry — check if it might be a local session
+    // Only fallback to localhost, never throw (allows local peer routing)
     const port = config.bridgePort || 9764;
     return `http://127.0.0.1:${port}`;
   }

@@ -1118,14 +1118,20 @@ function deliverResult(result: TaskResult) {
     }
     return;
   }
+  // Check if deliverTo is a local session (not just config.localName)
+  const isLocal = result.deliverTo === config.localName 
+    || result.deliverTo === myDisplayName()
+    || agents.some(a => !((a as any).remote) && a.name.toLowerCase() === (result.deliverTo || "").toLowerCase());
   // Forward results to origin machine if not local
-  if (result.deliverTo && result.deliverTo !== config.localName) {
-    const peerUrl = getPeerUrl(result.deliverTo, config);
-    if (peerUrl) {
-      fetch(`${peerUrl}/result`, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(result), signal: AbortSignal.timeout(5000) }).catch(() => {});
-    }
+  if (result.deliverTo && !isLocal) {
+    try {
+      const peerUrl = getPeerUrl(result.deliverTo, config);
+      if (peerUrl) {
+        fetch(`${peerUrl}/result`, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(result), signal: AbortSignal.timeout(5000) }).catch(() => {});
+      }
+    } catch {}
   }
-  if (result.deliverTo !== config.localName) return;
+  if (!isLocal) return;
 
   let message = `📬 Result from ${result.from}/${result.fromSession || "unknown"}:\n\n`;
 
@@ -1144,12 +1150,22 @@ function deliverResult(result: TaskResult) {
     for (const f of result.files) message += `  - ${f.filename} (${f.path})\n`;
   }
 
-  pi.sendMessage({
-    customType: "bridge-result",
-    content: message,
-    display: true,
-    details: makeMessageDetails("task_result", result.from, result.result, { taskId: result.taskId, hops: result.hops }),
-  }, { triggerTurn: true });
+  // Route to correct local session via broker (not just pi.sendMessage to current session)
+  const myName = myDisplayName();
+  if (result.deliverTo && result.deliverTo !== myName && brokerClient?.isConnected()) {
+    // Deliver to a different local session via broker
+    brokerClient.send(result.deliverTo, {
+      text: JSON.stringify({ type: "task_result", taskId: result.taskId, result: result.result, display: message }),
+    }).catch(() => {});
+  } else {
+    // Deliver to current session
+    pi.sendMessage({
+      customType: "bridge-result",
+      content: message,
+      display: true,
+      details: makeMessageDetails("task_result", result.from, result.result, { taskId: result.taskId, hops: result.hops }),
+    }, { triggerTurn: true });
+  }
 
   // Phase 2.4: Deliver to WhatsApp if needed
   if (whatsappBridge) {
@@ -1674,8 +1690,17 @@ export default function extension(api: ExtensionAPI) {
         return;
       }
       if (parsed.type === "task_result") {
-        debugLog("received task_result: " + parsed.taskId + " result=" + (parsed.result || "").slice(0,50));
+        debugLog("received task_result: " + parsed.taskId);
         taskResults.set(parsed.taskId, parsed.result);
+        // Display the formatted message to the user
+        if (parsed.display) {
+          pi.sendMessage({
+            customType: "bridge-result",
+            content: parsed.display,
+            display: true,
+            details: makeMessageDetails("task_result", from.name || from.id, parsed.result || "", { taskId: parsed.taskId }),
+          }, { triggerTurn: true });
+        }
         return;
       }
       if (parsed.type === "network_task_claimed") {
