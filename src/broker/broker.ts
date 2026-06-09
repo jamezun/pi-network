@@ -73,6 +73,9 @@ class NetworkBroker {
   private handleConnection(socket: net.Socket): void {
     let sessionId: string | null = null;
 
+    // Enable TCP keepalive so dead connections (crashes, network drops) are detected faster
+    socket.setKeepAlive(true, 15_000);
+
     const reader = createMessageReader((msg) => {
       this.handleMessage(socket, msg, sessionId, (id) => { sessionId = id; });
     }, (error) => {
