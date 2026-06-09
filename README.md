@@ -263,6 +263,64 @@ A copy of the default rules lives at `config/damage-control-rules.yaml` in this 
 
 ---
 
+## Protocol v2 — Media, Multi-Tenancy, Auth, Modality
+
+The broker protocol gained additive, backward-compatible upgrades that take pi-network from a single-user mesh toward a multi-tenant consumer relay. All new fields are **optional** — v1 callers keep working unchanged.
+
+### Reference-based Media Envelope (no binary in JSON)
+
+Binary never travels inline. Inline base64 is allowed only under **256 KB** (tiny snippets); real media lives at a reference URL.
+
+```typescript
+interface MediaAttachment {
+  kind: "image" | "audio" | "video" | "file";
+  url: string;            // object-storage reference; NEVER large base64
+  bytes: number;
+  mime: string;
+}
+```
+The broker **rejects** oversized inline attachments. This fixes the `JsonEOFException: Unexpected end-of-input` error caused by ~430 KB inline base64 bodies being truncated by Spring/Tomcat. The WhatsApp `sendFile` path now uploads binary via **multipart/form-data** (out-of-band).
+
+### Modality Adapters (`src/core/modality/`)
+
+A understand-then-dispatch pipeline that runs before delivery to the agent bridge:
+
+- **STT cascade** — Groq Whisper large-v3 → OpenAI `gpt-4o-mini-transcribe` → self-hosted `whisper.cpp`. First available + succeeding provider wins.
+- **Vision adapter** — vision-native models get passthrough; non-vision models get an injected `[Image: ...]` summary.
+- **Object storage** — local or S3-compatible backend, **AES-256-GCM at-rest encryption**, 30-day TTL with garbage collection.
+
+Media caps (stolen from OpenClaw): image 10 MB understand / 50 MB send, audio 20 MB / 16 MB, video 50 MB. Files under 1024 bytes are skipped before transcription.
+
+### Multi-Tenant Routing (`src/core/routing.ts`)
+
+Each `userId` owns a namespace of agents and conversations. User A's pool never leaks into User B's. Messages without a `userId` fall into the implicit `__system__` tenant (legacy single-user mode) so existing Tailscale deployments are unaffected. The broker scopes `list`, `session_joined`, and broadcasts by tenant, and **blocks cross-tenant routing**.
+
+### JWT Auth Handshake (`src/core/auth.ts`)
+
+Standard HS256 JWT carried in the `register` message. The broker validates on connect when consumer mode is on (env-gated). Tokens carry `userId`, `tier`, and rate-limit entitlements. **Tailscale trust remains the default** for self-hosted: when `PI_NETWORK_REQUIRE_AUTH` is unset, the token is optional.
+
+```bash
+# Opt into consumer auth on the broker:
+export PI_NETWORK_REQUIRE_AUTH=1
+export PI_NETWORK_AUTH_SECRET="your-hmac-secret"
+# Client passes a signed token:
+export PI_NETWORK_AUTH_TOKEN="<jwt>"
+```
+
+### Richer Delivery Receipts
+
+`seen` / `turn_started` / `turn_complete` server messages map to mobile "delivered" / "typing…" / "online" indicators, alongside the existing `delivered` / `delivery_failed`.
+
+### Generalized Inbound Dedupe (`src/core/dedupe.ts`)
+
+A TTL+LRU cache makes every inbound channel idempotent for 5 minutes (generalizes the WhatsApp replay guard). Per-user namespaced so the same `messageId` from two users can't collide. Mobile network retries are silently de-duplicated.
+
+### Sandbox Model (Phase 4 prep — `src/core/sandbox.ts`)
+
+Per-agent isolation ported from OpenClaw: `scope` (agent/session/shared) + `workspaceAccess` (none/ro/rw). Path canonicalization makes symlink/parent tricks **fail closed** against blocked roots (`/etc`, `/var/run`, credential dirs). Inbound media paths are rewritten into `media/inbound/<file>`.
+
+---
+
 ## Slash Commands (v2)
 
 | Command | What it does |
