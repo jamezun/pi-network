@@ -13,11 +13,26 @@ export interface PresenceUpdate {
   timestamp: number;
 }
 
+export interface SessionModalities {
+  vision: boolean;
+  voice: boolean;
+}
+
 export class PresenceManager {
   private currentState: PresenceState = "idle";
   private currentModel?: string;
+  private currentModalities?: SessionModalities;
   private updates: PresenceUpdate[] = [];
   private maxHistory = 100;
+
+  /** Improvement #3: declare this session's model modalities (vision/voice). */
+  setModalities(modalities: SessionModalities): void {
+    this.currentModalities = modalities;
+  }
+
+  getModalities(): SessionModalities | undefined {
+    return this.currentModalities;
+  }
 
   getState(): PresenceState {
     return this.currentState;

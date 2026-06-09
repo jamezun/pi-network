@@ -6,16 +6,19 @@ import net from "net";
 import { randomUUID } from "crypto";
 import { writeMessage, createMessageReader } from "./framing";
 import { getBrokerSocketPath } from "./paths";
-import type { SessionInfo, BrokerMessage, Attachment } from "./types";
+import type { SessionInfo, BrokerMessage, Attachment, MediaAttachment } from "./types";
 
 const BROKER_SOCKET = getBrokerSocketPath();
 
 interface SendOptions {
   text: string;
   attachments?: Attachment[];
+  media?: MediaAttachment[];
   replyTo?: string;
   expectsReply?: boolean;
   messageId?: string;
+  userId?: string;
+  conversationId?: string;
 }
 
 interface SendResult {
@@ -62,7 +65,7 @@ export class BrokerClient extends EventEmitter {
     return Boolean(s && this._sessionId && !this.disconnecting && !s.destroyed && s.writable);
   }
 
-  connect(session: Omit<SessionInfo, "id">): Promise<void> {
+  connect(session: Omit<SessionInfo, "id">, token?: string): Promise<void> {
     if (this.socket) return Promise.reject(new Error("Already connected"));
 
     return new Promise((resolve, reject) => {
@@ -125,7 +128,7 @@ export class BrokerClient extends EventEmitter {
       this.once("_registered", onRegistered);
 
       try {
-        writeMessage(socket, { type: "register", session });
+        writeMessage(socket, token ? { type: "register", session, token } : { type: "register", session });
       } catch (error) {
         cleanup();
         if (this.socket === socket) this.socket = null;
@@ -189,6 +192,20 @@ export class BrokerClient extends EventEmitter {
         if (isSessionInfo(m.session)) this.emit("presence_update", m.session);
         break;
       }
+
+      // Improvement #6: richer delivery receipts
+      case "seen": {
+        if (typeof m.messageId === "string") this.emit("seen", m.messageId);
+        break;
+      }
+      case "turn_started": {
+        if (typeof m.messageId === "string") this.emit("turn_started", m.messageId);
+        break;
+      }
+      case "turn_complete": {
+        if (typeof m.messageId === "string") this.emit("turn_complete", m.messageId);
+        break;
+      }
     }
   }
 
@@ -236,7 +253,9 @@ export class BrokerClient extends EventEmitter {
       timestamp: Date.now(),
       replyTo: options.replyTo,
       expectsReply: options.expectsReply,
-      content: { text: options.text, attachments: options.attachments },
+      userId: options.userId,
+      conversationId: options.conversationId,
+      content: { text: options.text, attachments: options.attachments, media: options.media },
     };
 
     return new Promise((resolve, reject) => {

@@ -126,16 +126,20 @@ export class WhatsAppTransport {
     if (!number) return;
 
     try {
-      const base64Data = typeof file.data === "string" ? file.data : file.data.toString("base64");
+      const buf = typeof file.data === "string" ? Buffer.from(file.data, "base64") : file.data;
+      // Improvement #1: send binary as multipart/form-data, NOT inline base64 JSON.
+      // Inline base64 in JSON bodies exceeds Tomcat/Evolution request limits and
+      // gets truncated → "JsonEOFException: Unexpected end-of-input".
+      const form = new FormData();
+      form.append("number", number);
+      form.append("fileName", file.fileName);
+      form.append("caption", `📎 ${file.fileName}`);
+      form.append("mimetype", file.mimeType || "application/octet-stream");
+      form.append("document", new Blob([buf]), file.fileName);
       await fetch(`${this.waConfig.evolutionApiUrl}/message/sendDocument/${this.waConfig.instanceName}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", apikey: this.waConfig.evolutionApiKey },
-        body: JSON.stringify({
-          number,
-          document: base64Data,
-          fileName: file.fileName,
-          caption: `📎 ${file.fileName}`,
-        }),
+        headers: { apikey: this.waConfig.evolutionApiKey },
+        body: form,
       });
     } catch (e: any) {
       console.error(`WhatsApp: Failed to send file: ${e.message}`);

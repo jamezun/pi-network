@@ -236,7 +236,11 @@ async function ensureBrokerConnected(reason: "startup" | "background" | "tool" |
         // Role is dynamic — set per-task by who delegates. No static role.
         capabilities: config.capabilities, specialties: config.specialties,
         color: config.color, purpose: config.purpose, project: config.project,
-      });
+        modalities: presenceManager.getModalities(),     // Improvement #3: vision/voice capability
+        userId: config.userId,                           // Improvement #4: multi-tenant scope
+      },
+      // Improvement #5: JWT token (optional; env-gated for consumer mode)
+      process.env.PI_NETWORK_AUTH_TOKEN);
       if (!getLiveContext(ctx, gen)) { await nextClient.disconnect(); throw new Error("Runtime no longer active"); }
       reconnectAttempt = 0;
       // Broker doesn't notify us about pre-existing sessions on connect, so fetch them now.
@@ -610,7 +614,7 @@ function refreshRemotePeers() {
         })),
       };
     } catch {
-      return { machine: peerName, sessions: [], online: false, host: peerCfg.host, bridgePort: port };
+      return { machine: peerName, sessions: [], online: false, host: peerCfg.host, bridgePort: port, fetchFailed: true };
     }
   })).then((results) => {
     for (const result of results) {
@@ -618,13 +622,29 @@ function refreshRemotePeers() {
       const { machine, sessions, online, host, bridgePort } = result;
 
       if (!online || sessions.length === 0) {
-        // Machine offline — mark existing remote agents from this machine as offline
+        // Machine offline — increment stale counter on fetch failure, instant offline on graceful response
         for (const a of agents) {
           if ((a as any).remote && ((a as any).configName || "").toLowerCase() === machine.toLowerCase()) {
-            a.status = "offline";
+            if ((result as any).fetchFailed) {
+              a.staleCount = (a.staleCount || 0) + 1;
+              if (a.staleCount >= 2) {
+                a.status = "offline";
+              } else {
+                a.status = "unresponsive";
+              }
+            } else {
+              a.status = "offline";
+            }
           }
         }
         continue;
+      }
+
+      // Reset stale counter for all agents from this machine on successful fetch
+      for (const a of agents) {
+        if ((a as any).remote && ((a as any).configName || "").toLowerCase() === machine.toLowerCase()) {
+          a.staleCount = 0;
+        }
       }
 
       // Add ALL sessions from the remote machine (skip WhatsApp synthetics)
@@ -1299,6 +1319,13 @@ export default function extension(api: ExtensionAPI) {
     concurrency = new ConcurrencyManager(config);
     idleQueue = new IdleQueue();
     presenceManager = new PresenceManager();
+    // Improvement #3: declare this session's modalities (vision/voice) from the model.
+    {
+      const m = (currentModel || "").toLowerCase();
+      const isVision = /gpt-4o|gpt-4.*turbo|claude-3|claude-4|claude-opus|claude-sonnet|gemini|glm-4v|qwen.*vl|pixtral/.test(m);
+      const isVoice = /gpt-4o|gemini/.test(m);
+      presenceManager.setModalities({ vision: isVision, voice: isVoice });
+    }
     replyTracker = new ReplyTracker();
     startLocalBridge(config.bridgePort);
     startHeartbeat();
@@ -1493,6 +1520,19 @@ export default function extension(api: ExtensionAPI) {
     runtimeContext = null;
     currentSessionId = null;
     sessionStartedAt = null;
+  });
+
+  // ─── Model change: push to broker immediately ───
+  pi.on("model_select", async (event, _ctx) => {
+    currentModel = event.model.id;
+    if (brokerClient?.isConnected()) {
+      brokerClient.updatePresence({ model: normalizeModel(currentModel), name: myDisplayName() });
+    }
+    // Also update local registry
+    updateAgentInRegistry(agents, {
+      name: myDisplayName(),
+      model: normalizeModel(currentModel),
+    });
   });
 
   pi.on("before_agent_start", async (event, _ctx) => {
