@@ -451,19 +451,21 @@ export class WhatsAppBridge {
    * Send a file (docx, xls, pdf, md, etc.) to a WhatsApp number.
    */
   async sendFile(to: string, data: Buffer | string, fileName: string, mimeType: string, caption?: string): Promise<void> {
-    const base64 = typeof data === "string" ? data : data.toString("base64");
-    console.log("WhatsAppBridge.sendFile:", fileName, "mimeType:", mimeType, "base64 length:", base64.length);
+    const buf = typeof data === "string" ? Buffer.from(data, "base64") : data;
+    console.log("WhatsAppBridge.sendFile:", fileName, "mimeType:", mimeType, "bytes:", buf.length);
     try {
+      // Use multipart/form-data — binary out-of-band, NO inline base64 in JSON.
+      // Inline base64 in JSON bodies gets truncated by Spring/Tomcat → JsonEOFException.
+      const form = new FormData();
+      form.append("number", to);
+      form.append("fileName", fileName || "file");
+      form.append("caption", caption || fileName || "");
+      form.append("mimetype", mimeType);
+      form.append("document", new Blob([buf]), fileName || "file");
       const res = await fetch(`${this.waConfig.evolutionApiUrl}/message/sendDocument/${this.waConfig.instanceName}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", apikey: this.waConfig.evolutionApiKey },
-        body: JSON.stringify({
-          number: to,
-          document: base64,
-          fileName: fileName || "file",
-          caption: caption || fileName || "",
-          mimetype: mimeType,
-        }),
+        headers: { apikey: this.waConfig.evolutionApiKey },
+        body: form,
       });
       if (!res.ok) {
         const errBody = await res.text().catch(() => "");
